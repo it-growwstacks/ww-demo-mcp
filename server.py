@@ -563,76 +563,113 @@ def get_employee_status(
         return _build_error_response(Errors.INTERNAL_ERROR)
 
 
-# ── Add OAuth endpoints directly to the FastMCP app ──────────────────
-# FastMCP exposes custom_route() to add HTTP routes alongside /mcp.
-# This is cleaner than wrapping in a second Starlette app.
+# ── OAuth endpoints — Supabase handles auth, we only need discovery + consent UI ──
 
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
 async def discovery(request):
     from starlette.responses import JSONResponse
-    base = os.environ.get("MCP_BASE_URL", "http://localhost:8000")
+    supabase_issuer = os.environ.get("SUPABASE_ISSUER", "")
+    mcp_base = os.environ.get("MCP_BASE_URL", "http://localhost:8000")
     return JSONResponse({
-        "issuer": base,
-        "authorization_endpoint": f"{base}/authorize",
-        "token_endpoint": f"{base}/token",
-        "registration_endpoint": f"{base}/register",
+        "issuer": supabase_issuer,
+        "authorization_endpoint": f"{mcp_base}/oauth/consent",
+        "token_endpoint": f"{supabase_issuer}/oauth/token",
+        "registration_endpoint": f"{supabase_issuer}/oauth/clients",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "none"],
     })
 
 
-@mcp.custom_route("/authorize", methods=["GET"])
-async def authorize(request):
-    from starlette.responses import RedirectResponse
-    import urllib.parse
-    params = dict(request.query_params)
-    params["client_id"] = os.environ.get("CLERK_OAUTH_CLIENT_ID", "")
-    clerk_url = os.environ.get("CLERK_OAUTH_AUTHORIZE_URL", "")
-    query = urllib.parse.urlencode(params)
-    return RedirectResponse(url=f"{clerk_url}?{query}", status_code=302)
+@mcp.custom_route("/oauth/consent", methods=["GET", "POST"])
+async def oauth_consent(request):
+    from starlette.responses import HTMLResponse, RedirectResponse
+    from supabase import create_client
 
+    supabase_url = os.environ.get("SUPABASE_URL", "")
+    supabase_anon_key = os.environ.get("SUPABASE_ANON_KEY", "")
+    supabase = create_client(supabase_url, supabase_anon_key)
 
-@mcp.custom_route("/token", methods=["POST"])
-async def token(request):
-    import httpx
-    from starlette.responses import JSONResponse
-    form = await request.form()
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            os.environ.get("CLERK_OAUTH_TOKEN_URL", ""),
-            data={
-                "grant_type": "authorization_code",
-                "code": form.get("code", ""),
-                "redirect_uri": form.get("redirect_uri", ""),
-                "client_id": os.environ.get("CLERK_OAUTH_CLIENT_ID", ""),
-                "client_secret": os.environ.get("CLERK_OAUTH_CLIENT_SECRET", ""),
-                "code_verifier": form.get("code_verifier", ""),
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=10,
-        )
-    if response.status_code != 200:
-        return JSONResponse(
-            {"error": "token_exchange_failed", "detail": response.text},
-            status_code=400,
-        )
-    return JSONResponse(response.json())
+    authorization_id = request.query_params.get("authorization_id", "")
 
-@mcp.custom_route("/register", methods=["POST"])
-async def register(request):
-    from starlette.responses import JSONResponse
-    # Return pre-configured client credentials
-    # Claude.ai calls this to get client_id/secret for the OAuth flow
-    return JSONResponse({
-        "client_id": os.environ.get("CLERK_OAUTH_CLIENT_ID", ""),
-        "client_secret": os.environ.get("CLERK_OAUTH_CLIENT_SECRET", ""),
-        "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
-        "grant_types": ["authorization_code"],
-        "response_types": ["code"],
-        "token_endpoint_auth_method": "client_secret_post",
-    })
+    if request.method == "GET":
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>GrowwStacks MCP — Authorize</title>
+            <style>
+                body {{ font-family: sans-serif; max-width: 400px; margin: 80px auto; padding: 0 20px; }}
+                h2 {{ color: #1a1a1a; }}
+                p {{ color: #666; font-size: 14px; }}
+                input {{ width: 100%; padding: 10px; margin: 8px 0; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 14px; }}
+                button {{ width: 100%; padding: 12px; background: #10b981; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; margin-top: 8px; }}
+                button:hover {{ background: #059669; }}
+                .logo {{ font-size: 24px; font-weight: bold; color: #10b981; margin-bottom: 8px; }}
+            </style>
+        </head>
+        <body>
+            <div class="logo">GrowwStacks</div>
+            <h2>Authorize AI Access</h2>
+            <p>An AI assistant is requesting access to your WorkWitness employee data. Sign in to approve.</p>
+            <form method="POST">
+                <input type="hidden" name="authorization_id" value="{authorization_id}"/>
+                <input type="email" name="email" placeholder="Email address" required/>
+                <input type="password" name="password" placeholder="Password" required/>
+                <button type="submit">Authorize Access</button>
+            </form>
+        </body>
+        </html>
+        """
+        return HTMLResponse(html)
+
+    if request.method == "POST":
+        form = await request.form()
+        email = form.get("email", "")
+        password = form.get("password", "")
+        auth_id = form.get("authorization_id", "")
+
+        try:
+            result = supabase.auth.sign_in_with_password({
+                "email": email,
+                "password": password
+            })
+            if not result.user:
+                raise Exception("Login failed")
+
+            approval = supabase.auth.oauth.approve_authorization(auth_id)
+            return RedirectResponse(url=approval.redirect_uri, status_code=302)
+
+        except Exception as e:
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>GrowwStacks MCP — Authorize</title>
+                <style>
+                    body {{ font-family: sans-serif; max-width: 400px; margin: 80px auto; padding: 0 20px; }}
+                    h2 {{ color: #1a1a1a; }}
+                    .error {{ color: #dc2626; font-size: 14px; margin-bottom: 12px; }}
+                    input {{ width: 100%; padding: 10px; margin: 8px 0; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; font-size: 14px; }}
+                    button {{ width: 100%; padding: 12px; background: #10b981; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; margin-top: 8px; }}
+                    .logo {{ font-size: 24px; font-weight: bold; color: #10b981; margin-bottom: 8px; }}
+                </style>
+            </head>
+            <body>
+                <div class="logo">GrowwStacks</div>
+                <h2>Authorize AI Access</h2>
+                <p class="error">Incorrect email or password. Please try again.</p>
+                <form method="POST">
+                    <input type="hidden" name="authorization_id" value="{auth_id}"/>
+                    <input type="email" name="email" placeholder="Email address" required/>
+                    <input type="password" name="password" placeholder="Password" required/>
+                    <button type="submit">Authorize Access</button>
+                </form>
+            </body>
+            </html>
+            """
+            return HTMLResponse(html, status_code=401)
 
 
 if __name__ == "__main__":

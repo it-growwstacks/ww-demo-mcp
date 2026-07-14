@@ -9,3 +9,4 @@ httpx
 PyJWT[crypto]
 requests
 clerk-backend-api
+supabase>=2.0.0

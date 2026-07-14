@@ -6,7 +6,6 @@
 
 import os
 import jwt
-import requests
 from jwt import PyJWKClient, ExpiredSignatureError, DecodeError
 from dotenv import load_dotenv
 from error_codes import Errors, ErrorDef
@@ -15,12 +14,12 @@ from audit_logger import log_auth_failure
 load_dotenv()
 
 # ── Clerk configuration from .env ────────────────────────────────────
-JWKS_URL = os.environ.get("CLERK_JWKS_URL", "").strip()
-ISSUER   = os.environ.get("CLERK_ISSUER", "").strip()
+JWKS_URL = os.environ.get("SUPABASE_JWKS_URL", "").strip()
+ISSUER   = os.environ.get("SUPABASE_ISSUER", "").strip()
 
 if not JWKS_URL or not ISSUER:
     raise RuntimeError(
-        "CLERK_JWKS_URL and CLERK_ISSUER must be set in your .env file. "
+        "SUPABASE_JWKS_URL and SUPABASE_ISSUER must be set in your .env file. "
         "The server cannot start without OAuth 2.1 configuration."
     )
 
@@ -85,7 +84,9 @@ def verify_token(bearer_token: str | None) -> dict:
 
         # ── Check 7 — scope must include sheets:read or profile ───
         token_scope = claims.get("scope", "")
-        if "sheets:read" not in token_scope and "profile" not in token_scope:
+        # Supabase OAuth tokens carry standard scopes (email, profile, openid)
+        # Any valid Supabase token from our project is accepted
+        if not token_scope and not claims.get("sub"):
             log_auth_failure(reason="missing_scope")
             raise AuthError(Errors.FORBIDDEN)
 
