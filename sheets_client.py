@@ -28,8 +28,20 @@ from error_codes import ErrorCode, ErrorMessage
 load_dotenv()
 
 # ── Configuration ─────────────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────
 SHEET_ID         = os.environ.get("SHEET_ID", "")
 CREDENTIALS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+
+# ── Write credentials.json from base64 env var if present ────────────
+# Railway cannot mount local files, so the service account JSON is
+# stored as a base64-encoded environment variable and written to disk
+# at startup. Safe — the container filesystem is ephemeral and isolated.
+_creds_b64 = os.environ.get("GOOGLE_CREDENTIALS_BASE64", "")
+if _creds_b64 and not os.path.exists(CREDENTIALS_FILE):
+    import base64
+    with open(CREDENTIALS_FILE, "wb") as _f:
+        _f.write(base64.b64decode(_creds_b64))
+
 SCOPES           = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 TAB_EMPLOYEES    = "Employees"
 TAB_ACTIVITY     = "DailyActivity"
