@@ -2,13 +2,11 @@
 # WorkWitness Sheets MCP Server
 # Single tool implementation: get_employee_status
 # Production-grade — all 8 layers active
-#
-# FIXES APPLIED IN THIS VERSION:
+
 # Fix 1  (Layer 3)  — Explicit rejection when both company_id and sub are missing
 # Fix 2  (Layer 4)  — rate_limiter.py bug fixed (company_id → api_key) — see rate_limiter.py
 # Fix 3  (Layer 4)  — retry_after_seconds added to rate limit response
-# Fix 4  (Layer 7)  — ALL log_tool_call calls wrapped in try/except
-#                      so a disk-full never kills a successful response
+# Fix 4  (Layer 7)  — ALL log_tool_call calls wrapped in try/except so a disk-full never kills a successful response
 # Fix 5  (Layer 8)  — focus_score: None when not recorded, not 0
 # Fix 6  (Layer 8)  — hours_worked: sanity check > 24 = data error
 # Fix 7  (Layer 8)  — blockers: expanded NO_BLOCKER_VALUES set
@@ -32,7 +30,7 @@ from sheets_client import (
     SheetsError,
 )
 from audit_logger import log_tool_call
-from error_codes import ErrorCode, ErrorMessage
+from error_codes import Errors
 
 load_dotenv()
 
@@ -138,16 +136,16 @@ def _compute_performance_signal(
     return "needs_attention"
 
 
-def _build_error_response(code: str, message: str) -> dict:
+def _build_error_response(error, message: str | None = None) -> dict:
     """
-    Builds a clean, structured error response.
+    Builds a clean, structured error response from an ErrorDef.
     This is the ONLY format errors ever leave the server in.
     No stack traces. No internal paths. No raw exception messages.
     """
     return {
         "error": True,
-        "code": code,
-        "message": message,
+        "code": error.code,
+        "message": message or error.message,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -259,9 +257,8 @@ def get_employee_status(
 
         company_id = claims.get("company_id") or claims.get("sub")
         if not company_id:
-            # Fix 1 — explicit rejection, not silent fallback to "unknown"
             raise AuthError(
-                code=ErrorCode.UNAUTHENTICATED,
+                Errors.UNAUTHENTICATED,
                 message="Token is missing required identity claims."
             )
 
@@ -340,17 +337,17 @@ def get_employee_status(
         # Edge case A — employee code does not exist in the Employees tab
         if not employee:
             duration = int((time.time() - start_time) * 1000)
-            _safe_log(  # Fix 4 — wrapped
+            _safe_log(
                 api_key=company_id,
                 tool=tool_name,
                 inputs={"employee_code": employee_code},
-                outcome=ErrorCode.EMPLOYEE_NOT_FOUND,
+                outcome=Errors.EMPLOYEE_NOT_FOUND.code,
                 duration_ms=duration,
             )
             return _build_error_response(
-                ErrorCode.EMPLOYEE_NOT_FOUND,
-                f"No employee found with code '{validated.employee_code}'. "
-                f"Please check the employee code and try again."
+                Errors.EMPLOYEE_NOT_FOUND,
+                message=f"No employee found with code '{validated.employee_code}'. "
+                        f"Please check the employee code and try again."
             )
 
         # Read 2 — fetch the most recent activity record
@@ -509,77 +506,61 @@ def get_employee_status(
     # ════════════════════════════════════════════════════════════
 
     except AuthError as e:
-        # Token missing, expired, forged, wrong issuer, wrong scope,
-        # or missing identity claims (Fix 1).
-        # inputs={} — never log what an unauthenticated caller sent.
         duration = int((time.time() - start_time) * 1000)
-        _safe_log(  # Fix 4
+        _safe_log(
             api_key="unauthenticated",
             tool=tool_name,
             inputs={},
-            outcome=e.code,
+            outcome=e.error.code,
             duration_ms=duration,
         )
-        return _build_error_response(e.code, e.message)
+        return _build_error_response(e.error, message=e.message)
 
     except RateLimitError as e:
-        # Too many requests from this company in the last 60 seconds.
-        # Fix 3 — retry_after_seconds tells caller exactly how long to wait.
-        # Fix 4 — _safe_log used.
         duration = int((time.time() - start_time) * 1000)
-        _safe_log(  # Fix 4
+        _safe_log(
             api_key=company_id,
             tool=tool_name,
             inputs={"employee_code": employee_code},
-            outcome=e.code,
+            outcome=e.error.code,
             duration_ms=duration,
         )
-        response = _build_error_response(e.code, e.message)
-        response["retry_after_seconds"] = getattr(e, "retry_after", 60)  # Fix 3
+        response = _build_error_response(e.error)
+        response["retry_after_seconds"] = e.retry_after
         return response
 
     except ValidationError as e:
-        # employee_code missing, empty, too long, or contains invalid
-        # characters (spaces, symbols — caught by regex in validators.py).
         duration = int((time.time() - start_time) * 1000)
-        _safe_log(  # Fix 4
+        _safe_log(
             api_key=company_id,
             tool=tool_name,
             inputs={"employee_code": employee_code},
-            outcome=e.code,
+            outcome=e.error.code,
             duration_ms=duration,
         )
-        return _build_error_response(e.code, e.message)
+        return _build_error_response(e.error, message=e.message)
 
     except SheetsError as e:
-        # Google Sheets API unreachable, permission denied,
-        # tab not found, or other Sheets-specific failure.
         duration = int((time.time() - start_time) * 1000)
-        _safe_log(  # Fix 4
+        _safe_log(
             api_key=company_id,
             tool=tool_name,
             inputs={"employee_code": employee_code},
-            outcome=e.code,
+            outcome=e.error.code,
             duration_ms=duration,
         )
-        return _build_error_response(e.code, e.message)
+        return _build_error_response(e.error, message=e.message)
 
     except Exception:
-        # Catch-all for genuinely unexpected errors.
-        # The real exception is visible in stderr / monitoring.
-        # The caller receives only a safe, generic message.
         duration = int((time.time() - start_time) * 1000)
-        _safe_log(  # Fix 4
+        _safe_log(
             api_key=company_id,
             tool=tool_name,
             inputs={"employee_code": employee_code},
-            outcome=ErrorCode.INTERNAL_ERROR,
+            outcome=Errors.INTERNAL_ERROR.code,
             duration_ms=duration,
         )
-        return _build_error_response(
-            ErrorCode.INTERNAL_ERROR,
-            ErrorMessage.INTERNAL_ERROR,
-        )
+        return _build_error_response(Errors.INTERNAL_ERROR)
 
 
 # ── Add OAuth endpoints directly to the FastMCP app ──────────────────
