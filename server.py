@@ -595,15 +595,16 @@ async def debug_headers(request):
 @mcp.custom_route("/oauth/consent", methods=["GET", "POST"])
 async def oauth_consent(request):
     from starlette.responses import HTMLResponse, RedirectResponse
-    from supabase import create_client
+    import httpx
 
-    supabase_url = os.environ.get("SUPABASE_URL", "")
-    supabase_anon_key = os.environ.get("SUPABASE_ANON_KEY", "")
-    supabase = create_client(supabase_url, supabase_anon_key)
-
-    authorization_id = request.query_params.get("authorization_id", "")
-
+    # Extract OAuth params — from query string on GET, from form on POST
     if request.method == "GET":
+        client_id = request.query_params.get("client_id", "")
+        redirect_uri = request.query_params.get("redirect_uri", "")
+        code_challenge = request.query_params.get("code_challenge", "")
+        code_challenge_method = request.query_params.get("code_challenge_method", "")
+        state = request.query_params.get("state", "")
+
         html = f"""
         <!DOCTYPE html>
         <html>
@@ -622,9 +623,13 @@ async def oauth_consent(request):
         <body>
             <div class="logo">GrowwStacks</div>
             <h2>Authorize AI Access</h2>
-            <p>An AI assistant is requesting access to your WorkWitness employee data. Sign in to approve.</p>
+            <p>Sign in to grant your AI assistant access to WorkWitness data.</p>
             <form method="POST">
-                <input type="hidden" name="authorization_id" value="{authorization_id}"/>
+                <input type="hidden" name="client_id" value="{client_id}"/>
+                <input type="hidden" name="redirect_uri" value="{redirect_uri}"/>
+                <input type="hidden" name="code_challenge" value="{code_challenge}"/>
+                <input type="hidden" name="code_challenge_method" value="{code_challenge_method}"/>
+                <input type="hidden" name="state" value="{state}"/>
                 <input type="email" name="email" placeholder="Email address" required/>
                 <input type="password" name="password" placeholder="Password" required/>
                 <button type="submit">Authorize Access</button>
@@ -639,16 +644,15 @@ async def oauth_consent(request):
         email = form.get("email", "")
         password = form.get("password", "")
 
-        # Get OAuth params from query string
-        client_id = request.query_params.get("client_id", "")
-        redirect_uri = request.query_params.get("redirect_uri", "")
-        code_challenge = request.query_params.get("code_challenge", "")
-        code_challenge_method = request.query_params.get("code_challenge_method", "")
-        state = request.query_params.get("state", "")
+        # Read OAuth params from hidden form fields — not query string
+        client_id = form.get("client_id", "")
+        redirect_uri = form.get("redirect_uri", "")
+        code_challenge = form.get("code_challenge", "")
+        code_challenge_method = form.get("code_challenge_method", "")
+        state = form.get("state", "")
 
         try:
             from supabase import create_client
-            import httpx
             from starlette.responses import RedirectResponse
 
             supabase_url = os.environ.get("SUPABASE_URL", "")
@@ -665,8 +669,7 @@ async def oauth_consent(request):
 
             access_token = result.session.access_token
 
-            # Step 2 — call Supabase OAuth authorize endpoint directly
-            # This is the correct endpoint for the OAuth server flow
+            # Step 2 — call Supabase OAuth authorize with user's Bearer token
             approve_resp = httpx.get(
                 f"{supabase_url}/auth/v1/oauth/authorize",
                 params={
@@ -684,7 +687,7 @@ async def oauth_consent(request):
                 follow_redirects=False,
             )
 
-            # Step 3 — Supabase returns a redirect to claude.ai with the code
+            # Step 3 — Supabase redirects to claude.ai with the auth code
             if approve_resp.status_code in (301, 302, 303, 307, 308):
                 return RedirectResponse(
                     url=approve_resp.headers["location"],
@@ -716,6 +719,11 @@ async def oauth_consent(request):
                 <h2>Authorize AI Access</h2>
                 <p class="error">Error: {error_detail}</p>
                 <form method="POST">
+                    <input type="hidden" name="client_id" value="{client_id}"/>
+                    <input type="hidden" name="redirect_uri" value="{redirect_uri}"/>
+                    <input type="hidden" name="code_challenge" value="{code_challenge}"/>
+                    <input type="hidden" name="code_challenge_method" value="{code_challenge_method}"/>
+                    <input type="hidden" name="state" value="{state}"/>
                     <input type="email" name="email" placeholder="Email address" required/>
                     <input type="password" name="password" placeholder="Password" required/>
                     <button type="submit">Authorize Access</button>
