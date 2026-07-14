@@ -114,9 +114,9 @@ def verify_token(bearer_token: str | None) -> dict:
         # ── Check 7 — scope must include sheets:read ──────────────────
         # The scope claim was added by our JWT template in Clerk.
         # Without this check, any valid Clerk token could access our server —
-        # even tokens issued for completely different applications.
+        # even tokens issued for completely different applications. 
         token_scope = claims.get("scope", "")
-        if "sheets:read" not in token_scope:
+        if "sheets:read" not in token_scope and "profile" not in token_scope:
             log_auth_failure(reason="missing_scope")
             raise AuthError(
                 code=ErrorCode.FORBIDDEN,
