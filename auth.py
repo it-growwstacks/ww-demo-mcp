@@ -73,7 +73,7 @@ def verify_token(bearer_token: str | None) -> dict:
         claims = jwt.decode(
             token,
             signing_key.key,
-            algorithms=["RS256"],
+            algorithms=["RS256", "ES256"],
             issuer=ISSUER,
             options={
                 "require": ["exp", "iss", "sub"],
@@ -81,7 +81,8 @@ def verify_token(bearer_token: str | None) -> dict:
                 "verify_iss": True,
             }
         )
-
+        # After the claims = jwt.decode(...) block, add this one line:
+        print(f"DEBUG TOKEN CLAIMS: {claims}", flush=True)
         # ── Check 7 — scope must include sheets:read or profile ───
         token_scope = claims.get("scope", "")
         # Supabase OAuth tokens carry standard scopes (email, profile, openid)
