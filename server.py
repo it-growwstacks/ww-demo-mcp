@@ -580,6 +580,16 @@ async def discovery(request):
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "none"],
     })
+    
+@mcp.custom_route("/debug-headers", methods=["GET", "POST"])
+async def debug_headers(request):
+    from starlette.responses import JSONResponse
+    headers = dict(request.headers)
+    params = dict(request.query_params)
+    return JSONResponse({
+        "headers": headers,
+        "query_params": params,
+    })
 
 
 @mcp.custom_route("/oauth/consent", methods=["GET", "POST"])
