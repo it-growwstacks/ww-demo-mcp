@@ -638,9 +638,24 @@ async def oauth_consent(request):
         form = await request.form()
         email = form.get("email", "")
         password = form.get("password", "")
-        auth_id = form.get("authorization_id", "")
+
+        # Get OAuth params from query string
+        client_id = request.query_params.get("client_id", "")
+        redirect_uri = request.query_params.get("redirect_uri", "")
+        code_challenge = request.query_params.get("code_challenge", "")
+        code_challenge_method = request.query_params.get("code_challenge_method", "")
+        state = request.query_params.get("state", "")
 
         try:
+            from supabase import create_client
+            import httpx
+            from starlette.responses import RedirectResponse
+
+            supabase_url = os.environ.get("SUPABASE_URL", "")
+            supabase_anon_key = os.environ.get("SUPABASE_ANON_KEY", "")
+            supabase = create_client(supabase_url, supabase_anon_key)
+
+            # Step 1 — sign in, get access token
             result = supabase.auth.sign_in_with_password({
                 "email": email,
                 "password": password
@@ -648,10 +663,40 @@ async def oauth_consent(request):
             if not result.user:
                 raise Exception("Login failed")
 
-            approval = supabase.auth.oauth.approve_authorization(auth_id)
-            return RedirectResponse(url=approval.redirect_uri, status_code=302)
+            access_token = result.session.access_token
+
+            # Step 2 — call Supabase OAuth authorize endpoint directly
+            # This is the correct endpoint for the OAuth server flow
+            approve_resp = httpx.get(
+                f"{supabase_url}/auth/v1/oauth/authorize",
+                params={
+                    "response_type": "code",
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
+                    "code_challenge": code_challenge,
+                    "code_challenge_method": code_challenge_method,
+                    "state": state,
+                },
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "apikey": supabase_anon_key,
+                },
+                follow_redirects=False,
+            )
+
+            # Step 3 — Supabase returns a redirect to claude.ai with the code
+            if approve_resp.status_code in (301, 302, 303, 307, 308):
+                return RedirectResponse(
+                    url=approve_resp.headers["location"],
+                    status_code=302
+                )
+            else:
+                raise Exception(
+                    f"OAuth approve returned {approve_resp.status_code}: {approve_resp.text[:300]}"
+                )
 
         except Exception as e:
+            error_detail = str(e)
             html = f"""
             <!DOCTYPE html>
             <html>
@@ -669,9 +714,8 @@ async def oauth_consent(request):
             <body>
                 <div class="logo">GrowwStacks</div>
                 <h2>Authorize AI Access</h2>
-                <p class="error">Incorrect email or password. Please try again.</p>
+                <p class="error">Error: {error_detail}</p>
                 <form method="POST">
-                    <input type="hidden" name="authorization_id" value="{auth_id}"/>
                     <input type="email" name="email" placeholder="Email address" required/>
                     <input type="password" name="password" placeholder="Password" required/>
                     <button type="submit">Authorize Access</button>
