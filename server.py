@@ -36,7 +36,7 @@ from error_codes import ErrorCode, ErrorMessage
 
 load_dotenv()
 
-mcp = FastMCP("workwitness-sheets-mcp")
+mcp = FastMCP("workwitness-sheets-mcp", host="0.0.0.0", port=8000)
 
 
 # ── Expanded no-blocker values (Fix 7) ───────────────────────────────
