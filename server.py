@@ -359,17 +359,20 @@ async def oauth_consent(request):
     if request.method == "GET":
         supabase_url = os.environ.get("SUPABASE_URL", "")
 
-        # Forward ALL query params to Supabase's authorization endpoint
         params = dict(request.query_params)
 
-        # If client_id is missing, inject our pre-registered Supabase OAuth App ID
+        # Inject required params if missing
         if not params.get("client_id"):
             params["client_id"] = "2c765805-ae25-4ceb-8d4e-1b9051628ac9"
+        if not params.get("redirect_uri"):
+            params["redirect_uri"] = "https://claude.ai/api/mcp/auth_callback"
+        if not params.get("response_type"):
+            params["response_type"] = "code"
 
         query_string = urllib.parse.urlencode(params)
         supabase_auth_url = f"{supabase_url}/auth/v1/oauth/authorize?{query_string}"
 
-        print(f"DEBUG GET: redirecting to: {supabase_auth_url[:150]}", flush=True)
+        print(f"DEBUG GET: redirecting to: {supabase_auth_url[:200]}", flush=True)
         return RedirectResponse(url=supabase_auth_url, status_code=302)
 
     if request.method == "POST":
