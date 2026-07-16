@@ -683,38 +683,21 @@ async def oauth_consent(request):
             access_token = result.session.access_token
             print(f"DEBUG: Login success user={result.user.email}", flush=True)
 
-            # Step 2 — approve via Supabase OAuth authorize endpoint
-            # Use GET with Bearer token — this is how Supabase OAuth server works
-            if client_id:
-                # Standard PKCE flow — client_id present
-                approve_resp = httpx.get(
-                    f"{supabase_url}/auth/v1/oauth/authorize",
-                    headers={
-                        "Authorization": f"Bearer {access_token}",
-                        "apikey": supabase_anon_key,
-                    },
-                    params={
-                        "response_type": "code",
-                        "client_id": client_id,
-                        "redirect_uri": redirect_uri,
-                        "code_challenge": code_challenge,
-                        "code_challenge_method": code_challenge_method,
-                        "state": state,
-                    },
-                    follow_redirects=False,
-                )
-            else:
-                # authorization_id flow
-                approve_resp = httpx.post(
-                    f"{supabase_url}/auth/v1/oauth/authorize",
-                    headers={
-                        "Authorization": f"Bearer {access_token}",
-                        "apikey": supabase_anon_key,
-                        "Content-Type": "application/json",
-                    },
-                    json={"authorization_id": authorization_id},
-                    follow_redirects=False,
-                )
+            # Step 2 — approve via Supabase callback endpoint
+            # This is the correct endpoint — accepts POST with authorization_id + state
+            approve_resp = httpx.post(
+                f"{supabase_url}/auth/v1/callback",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "apikey": supabase_anon_key,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "authorization_id": authorization_id,
+                    "state": state,
+                },
+                follow_redirects=False,
+            )
 
             print(f"DEBUG approve: status={approve_resp.status_code} headers={dict(approve_resp.headers)} body={approve_resp.text[:400]}", flush=True)
 
