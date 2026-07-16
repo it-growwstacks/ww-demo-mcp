@@ -357,23 +357,22 @@ async def oauth_consent(request):
     import httpx
 
     if request.method == "GET":
-        # ── Key change: redirect directly to Supabase's hosted auth UI ──
-        # Our custom form cannot handle the state correctly because Supabase
-        # stores state internally against the authorization_id.
-        # Supabase's own UI handles this correctly and redirects to claude.ai.
         supabase_url = os.environ.get("SUPABASE_URL", "")
-        supabase_anon_key = os.environ.get("SUPABASE_ANON_KEY", "")
 
         # Forward ALL query params to Supabase's authorization endpoint
         params = dict(request.query_params)
+
+        # If client_id is missing, inject our pre-registered Supabase OAuth App ID
+        if not params.get("client_id"):
+            params["client_id"] = "2c765805-ae25-4ceb-8d4e-1b9051628ac9"
+
         query_string = urllib.parse.urlencode(params)
         supabase_auth_url = f"{supabase_url}/auth/v1/oauth/authorize?{query_string}"
 
-        print(f"DEBUG GET: redirecting to Supabase auth URL: {supabase_auth_url[:120]}", flush=True)
+        print(f"DEBUG GET: redirecting to: {supabase_auth_url[:150]}", flush=True)
         return RedirectResponse(url=supabase_auth_url, status_code=302)
 
     if request.method == "POST":
-        # ── POST kept as fallback in case Supabase redirects back here ──
         form = await request.form()
         email = form.get("email", "")
         password = form.get("password", "")
@@ -394,7 +393,6 @@ async def oauth_consent(request):
             supabase_anon_key = os.environ.get("SUPABASE_ANON_KEY", "")
             supabase = create_client(supabase_url, supabase_anon_key)
 
-            # Step 1 — sign in
             result = supabase.auth.sign_in_with_password({
                 "email": email,
                 "password": password
@@ -405,7 +403,6 @@ async def oauth_consent(request):
             access_token = result.session.access_token
             print(f"DEBUG: Login success user={result.user.email}", flush=True)
 
-            # Step 2 — call Supabase callback with authorization_id + state
             approve_resp = httpx.post(
                 f"{supabase_url}/auth/v1/callback",
                 headers={
