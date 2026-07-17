@@ -40,9 +40,9 @@ def validate_date_format(date_str: str) -> str:
 class EmployeeStatusInput(BaseModel):
     employee_code: str = Field(
         min_length=1,
-        max_length=20,
-        pattern=r'^[A-Za-z0-9\-]+$',
-        description="Employee code from the Employees sheet, e.g. E001"
+        max_length=50,
+        pattern=r'^[A-Za-z0-9\-\s]+$',
+        description="Employee code (e.g. E001) or employee name (e.g. Mohit)"
     )
     model_config = {"populate_by_name": True}
 
@@ -51,6 +51,24 @@ class EmployeeStatusInput(BaseModel):
     def strip_whitespace(cls, v: str) -> str:
         return v.strip()
 
+class DailyBriefInput(BaseModel):
+    employee_code: str = Field(
+        min_length=1,
+        max_length=50,
+        pattern=r'^[A-Za-z0-9\-\s]+$',
+        description="Employee code (e.g. E001) or employee name (e.g. Mohit)"
+    )
+    date: str = Field(
+        pattern=r'^\d{4}-\d{2}-\d{2}$',
+        description="Date in YYYY-MM-DD format, e.g. 2026-07-01"
+    )
+
+class TopPerformersInput(BaseModel):
+    period: str = Field(
+        min_length=1,
+        max_length=20,
+        description="Period: 'daily', 'weekly', 'monthly', or a specific date in YYYY-MM-DD format"
+    )
 
 # ── Input model for get_team_summary ─────────────────────────────────
 

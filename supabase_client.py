@@ -54,6 +54,23 @@ def get_employee_by_code(employee_code: str) -> dict | None:
         _log.error(f"Supabase employees query failed: {e}")
         raise SheetsError(Errors.SHEETS_UNAVAILABLE, message=str(e))
 
+def get_employee_by_name(name: str) -> dict | None:
+    """
+    Searches for an employee by name (case-insensitive partial match).
+    Returns the first match or None.
+    """
+    try:
+        result = _supabase.table("employees") \
+            .select("*") \
+            .ilike("name", f"%{name}%") \
+            .execute()
+        if result.data and len(result.data) > 0:
+            return result.data[0]
+        return None
+    except Exception as e:
+        _log.error(f"Supabase name search failed: {e}")
+        return None
+
 
 def get_latest_activity_for_employee(employee_code: str) -> dict | None:
     """
@@ -94,3 +111,41 @@ def get_user_permissions(clerk_user_id: str) -> dict | None:
     except Exception as e:
         _log.error(f"Supabase permissions query failed: {e}")
         return None
+
+def get_activity_for_date(employee_code: str, date: str) -> dict | None:
+    """
+    Returns activity for a specific employee on a specific date.
+    Returns None if no activity found for that date.
+    """
+    try:
+        result = _supabase.table("daily_activity") \
+            .select("*") \
+            .ilike("employee_code", employee_code) \
+            .eq("date", date) \
+            .execute()
+        if result.data and len(result.data) > 0:
+            row = result.data[0]
+            if row.get("date"):
+                row["date"] = str(row["date"])
+            return row
+        return None
+    except Exception as e:
+        _log.error(f"Supabase activity query failed: {e}")
+        raise SheetsError(Errors.SHEETS_UNAVAILABLE, message=str(e))
+
+
+def get_top_performers(start_date: str, end_date: str) -> list:
+    """
+    Returns all activity rows within a date range for ranking.
+    """
+    try:
+        result = _supabase.table("daily_activity") \
+            .select("*, employees(name, department)") \
+            .gte("date", start_date) \
+            .lte("date", end_date) \
+            .order("date", desc=True) \
+            .execute()
+        return result.data or []
+    except Exception as e:
+        _log.error(f"Supabase top performers query failed: {e}")
+        raise SheetsError(Errors.SHEETS_UNAVAILABLE, message=str(e))
