@@ -85,7 +85,7 @@ export default {
       }
     }
 
-    const id = env.MCP_CONTAINER.idFromName("sheet-mcp");
+    const id = env.MCP_CONTAINER.idFromName("ww-demo");
     const container = env.MCP_CONTAINER.get(id);
     return container.fetch(request);
   },
