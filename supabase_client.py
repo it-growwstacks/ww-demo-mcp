@@ -559,3 +559,157 @@ def get_attendance_data(
     except Exception as e:
         _log.error(f"Supabase attendance query failed: {e}")
         raise SheetsError(Errors.SHEETS_UNAVAILABLE, message=str(e))
+
+
+# ============================================================
+# PART 1: Add to supabase_client.py (paste at the bottom)
+# ============================================================
+
+def get_goal_progress(
+    company_id: str,
+    visible_codes: list[str] | None = None,
+    employee_code: str | None = None,
+    include_completed: bool = False,
+) -> list[dict]:
+    """
+    Returns goal progress for all visible employees.
+
+    For each active goal:
+      - the target value
+      - the actual average for the metric over the goal period
+      - days measured
+      - assessment: on_track / below_target / no_data / achieved / missed
+
+    If employee_code is provided, only that employee's goals are returned.
+    If visible_codes is provided, only those employees are included.
+    If both are None, all active employees in the tenant are included.
+
+    include_completed=True also returns achieved/missed goals.
+    """
+    try:
+        # Determine which employees to include
+        if employee_code:
+            codes = [employee_code.upper()]
+        elif visible_codes is not None:
+            codes = visible_codes
+        else:
+            all_emp = (
+                _supabase.table("employees")
+                .select("employee_code")
+                .eq("company_id", company_id)
+                .eq("is_active", True)
+                .execute()
+            )
+            codes = [r["employee_code"] for r in (all_emp.data or [])]
+
+        if not codes:
+            return []
+
+        # Fetch goals
+        status_filter = ["active"] if not include_completed else ["active", "achieved", "missed"]
+        goals_result = (
+            _supabase.table("goals")
+            .select("goal_id, employee_code, metric, target_value, "
+                    "period_start, period_end, status")
+            .eq("company_id", company_id)
+            .in_("employee_code", codes)
+            .in_("status", status_filter)
+            .execute()
+        )
+        goals = goals_result.data or []
+        if not goals:
+            return []
+
+        # Fetch employee names
+        emp_result = (
+            _supabase.table("employees")
+            .select("employee_code, name, department_id")
+            .eq("company_id", company_id)
+            .in_("employee_code", codes)
+            .execute()
+        )
+        emp_map = {e["employee_code"]: e for e in (emp_result.data or [])}
+
+        # Resolve department names
+        dept_ids = list({
+            e["department_id"] for e in emp_map.values() if e.get("department_id")
+        })
+        dept_map = {}
+        if dept_ids:
+            dept_result = (
+                _supabase.table("departments")
+                .select("department_id, name")
+                .eq("company_id", company_id)
+                .in_("department_id", dept_ids)
+                .execute()
+            )
+            dept_map = {d["department_id"]: d["name"] for d in (dept_result.data or [])}
+
+        # For each goal, fetch activity in the goal period and compute actual
+        output = []
+        for goal in goals:
+            code = goal["employee_code"]
+            metric = goal["metric"]
+            target = float(goal["target_value"])
+            period_start = str(goal["period_start"])
+            period_end = str(goal["period_end"])
+
+            # Fetch activity rows in the goal period for this employee
+            activity_result = (
+                _supabase.table("daily_activity")
+                .select(f"{metric}, date")
+                .eq("company_id", company_id)
+                .eq("employee_code", code)
+                .gte("date", period_start)
+                .lte("date", period_end)
+                .execute()
+            )
+            activity_rows = activity_result.data or []
+
+            # Compute actual average — only rows where the metric is not NULL
+            valid_values = [
+                float(row[metric])
+                for row in activity_rows
+                if row.get(metric) is not None
+            ]
+            days_measured = len(valid_values)
+            actual_avg = round(sum(valid_values) / days_measured, 2) if days_measured > 0 else None
+
+            # Assessment
+            if goal["status"] == "achieved":
+                assessment = "achieved"
+            elif goal["status"] == "missed":
+                assessment = "missed"
+            elif days_measured == 0:
+                assessment = "no_data"
+            elif actual_avg >= target:
+                assessment = "on_track"
+            else:
+                assessment = "below_target"
+
+            # Percentage toward target (only when we have data)
+            pct_of_target = None
+            if actual_avg is not None and target > 0:
+                pct_of_target = round((actual_avg / target) * 100, 1)
+
+            emp = emp_map.get(code, {})
+            output.append({
+                "employee_code": code,
+                "name": emp.get("name", "Unknown"),
+                "department": dept_map.get(emp.get("department_id"), "Unknown"),
+                "metric": metric,
+                "target_value": target,
+                "actual_avg": actual_avg,
+                "pct_of_target": pct_of_target,
+                "days_measured": days_measured,
+                "period_start": period_start,
+                "period_end": period_end,
+                "goal_status": goal["status"],
+                "assessment": assessment,
+            })
+
+        return output
+
+    except Exception as e:
+        _log.error(f"Supabase goal progress query failed: {e}")
+        raise SheetsError(Errors.SHEETS_UNAVAILABLE, message=str(e))

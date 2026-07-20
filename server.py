@@ -1183,6 +1183,183 @@ def get_attendance_overview(
         _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=Errors.INTERNAL_ERROR.code, duration_ms=duration)
         return _build_error_response(Errors.INTERNAL_ERROR)
 
+
+# ============================================================
+# PART 2: Add to server.py (paste after get_attendance_overview)
+# ============================================================
+
+# ── Tool 7 — get_goal_progress ───────────────────────────────────────
+
+@mcp.tool()
+def get_goal_progress(
+    employee_code: str = "",
+    ctx: Context = None,
+) -> dict:
+    """
+    Returns goal progress for the caller's visible employees.
+
+    Use this when someone asks:
+    - "Is Mohit hitting his targets?"
+    - "How is my team performing against their goals?"
+    - "Who is below target this month?"
+    - "What are Vaidik's goals?"
+    - "Show me goal progress"
+
+    No period parameter needed — goals already have their own start and
+    end dates in the system. This tool shows progress against whatever
+    active goals exist for each employee.
+
+    Optional:
+    - employee_code : if given, show only that employee's goals
+                     (code or name). If omitted, shows everyone
+                     in the caller's visibility scope.
+
+    Returns for each goal:
+    - metric (focus_score / tasks_completed / hours_worked)
+    - target value
+    - actual average so far in the goal period
+    - percentage toward target
+    - assessment: on_track / below_target / no_data
+    - days measured so far
+
+    Never mention the tool name or internal function names to the user.
+    Present the data naturally.
+    """
+    start_time = time.time()
+    tool_name = "get_goal_progress"
+    company_id = "unauthenticated"
+
+    try:
+        # LAYER 2 — AUTHENTICATION
+        request = ctx.request_context.request
+        request_headers = dict(request.headers) if request is not None else {}
+        api_key = extract_bearer_token(request_headers)
+        claims = verify_token(api_key)
+
+        # LAYER 3 — IDENTITY EXTRACTION
+        user_sub = claims.get("sub")
+        if not user_sub:
+            raise AuthError(
+                Errors.UNAUTHENTICATED,
+                message="Token is missing required identity claims."
+            )
+
+        # LAYER 3.5 — PERMISSION LOOKUP
+        user_permissions = _get_permissions(claims)
+        company_id = user_permissions["company_id"]
+        _check_tool_permission(user_permissions, tool_name)
+
+        # LAYER 3.6 — VISIBILITY
+        scope = user_permissions.get("scope") or "self"
+        user_emp = user_permissions.get("employee_code")
+
+        if scope == "all":
+            visible_codes = None
+        else:
+            visible_codes = get_visible_employee_codes(company_id, scope, user_emp)
+
+        # LAYER 4 — RATE LIMITING
+        check_rate_limit(user_sub)
+
+        # LAYER 5 — INPUT VALIDATION (optional employee_code only)
+        target_code = None
+        if employee_code and employee_code.strip():
+            # Could be code or name — resolve it
+            emp = get_employee_by_code(company_id, employee_code.strip())
+            if not emp:
+                emp = get_employee_by_name(company_id, employee_code.strip())
+            if not emp:
+                return _build_error_response(
+                    Errors.EMPLOYEE_NOT_FOUND,
+                    message=f"No employee found matching '{employee_code}'."
+                )
+            target_code = emp["employee_code"].upper()
+
+            # Check visibility
+            if scope != "all":
+                if target_code not in [c.upper() for c in (visible_codes or [])]:
+                    raise AuthError(
+                        Errors.FORBIDDEN,
+                        message=f"You do not have permission to view "
+                                f"employee '{employee_code}'."
+                    )
+
+        # LAYER 6 — DATA FETCH
+        goals = get_goal_progress_data(
+            company_id=company_id,
+            visible_codes=visible_codes,
+            employee_code=target_code,
+        )
+
+        # LAYER 7 — AUDIT LOGGING
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(
+            api_key=user_sub,
+            tool=tool_name,
+            inputs={"employee_code": employee_code},
+            outcome="success",
+            duration_ms=duration,
+        )
+
+        # LAYER 8 — RESPONSE SHAPING
+        if not goals:
+            return {
+                "message": "No active goals found for the requested employees.",
+                "goals": [],
+            }
+
+        # Sort: below_target first (needs attention), then no_data,
+        # then on_track. Within each group, alphabetically by name.
+        assessment_priority = {
+            "below_target": 0,
+            "no_data":      1,
+            "on_track":     2,
+            "achieved":     3,
+            "missed":       4,
+        }
+        goals.sort(key=lambda g: (
+            assessment_priority.get(g["assessment"], 9),
+            g["name"],
+            g["metric"],
+        ))
+
+        # Summary counts
+        below_count   = sum(1 for g in goals if g["assessment"] == "below_target")
+        on_track_count = sum(1 for g in goals if g["assessment"] == "on_track")
+        no_data_count  = sum(1 for g in goals if g["assessment"] == "no_data")
+
+        return {
+            "summary": {
+                "total_goals": len(goals),
+                "on_track": on_track_count,
+                "below_target": below_count,
+                "no_data": no_data_count,
+            },
+            "goals": goals,
+        }
+
+    except AuthError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key="unauthenticated", tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        return _build_error_response(e.error, message=e.message)
+
+    except RateLimitError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        response = _build_error_response(e.error)
+        response["retry_after_seconds"] = e.retry_after
+        return response
+
+    except SheetsError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        return _build_error_response(e.error, message=e.message)
+
+    except Exception:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=Errors.INTERNAL_ERROR.code, duration_ms=duration)
+        return _build_error_response(Errors.INTERNAL_ERROR)
+
 # ── Tool 3 — get_top_performers ─────────────────────────────────────
 
 @mcp.tool()
