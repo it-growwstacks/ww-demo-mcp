@@ -30,6 +30,7 @@ from supabase_client import (
     get_top_performers as fetch_top_performers,
     get_visible_employee_codes,
     get_attendance_data,
+    get_goal_progress_data,
     SheetsError,
 )
 from audit_logger import log_tool_call
