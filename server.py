@@ -1,18 +1,15 @@
 # server.py
-# WorkWitness Sheets MCP Server
-# Single tool implementation: get_employee_status
-# Production-grade — all 8 layers active
-
-# Fix 1  (Layer 3)  — Explicit rejection when both company_id and sub are missing
-# Fix 2  (Layer 4)  — rate_limiter.py bug fixed (company_id → api_key) — see rate_limiter.py
-# Fix 3  (Layer 4)  — retry_after_seconds added to rate limit response
-# Fix 4  (Layer 7)  — ALL log_tool_call calls wrapped in try/except so a disk-full never kills a successful response
-# Fix 5  (Layer 8)  — focus_score: None when not recorded, not 0
-# Fix 6  (Layer 8)  — hours_worked: sanity check > 24 = data error
-# Fix 7  (Layer 8)  — blockers: expanded NO_BLOCKER_VALUES set
-# Fix 8  (Layer 8)  — staleness warning when data > 7 days old
-# Fix 9  (Layer 8)  — empty stage returns "Not recorded" not empty string
-# Fix 10 (Layer 8)  — _compute_performance_signal handles None focus_score
+# WW-Demo MCP Server
+# Production-grade — all 8 layers active (schema v2 multi-tenant)
+#
+# CHANGES vs previous version:
+#   - Fail-closed permissions (no row -> FORBIDDEN, never defaults)
+#   - Real company_id from user_permissions row (never from JWT sub)
+#   - scope-based visibility (self / direct_reports / department / all)
+#   - Every data-layer call is tenant-scoped with company_id
+#   - Rate limiting keyed on Clerk sub, not company (per-user, not per-tenant)
+#   - Removed DEBUG backdoor (was leaking token claims)
+#   - Fixed missing tool_name / start_time in get_top_performers
 
 import os
 import sys
@@ -31,6 +28,7 @@ from supabase_client import (
     get_user_permissions,
     get_activity_for_date,
     get_top_performers as fetch_top_performers,
+    get_visible_employee_codes,
     SheetsError,
 )
 from audit_logger import log_tool_call
@@ -41,14 +39,14 @@ load_dotenv()
 mcp = FastMCP("workwitness-sheets-mcp", host="0.0.0.0", port=8000)
 
 
-# ── Expanded no-blocker values (Fix 7) 
+# ── Expanded no-blocker values
 NO_BLOCKER_VALUES = {
     "none", "n/a", "nil", "no", "no blockers",
     "no blocker", "-", "—", "", "null", "na", "false", "0"
 }
 
 
-# ── Helper functions 
+# ── Helper functions ────────────────────────────────────────────────
 
 def _parse_int(value, default: int = 0) -> int:
     try:
@@ -120,26 +118,27 @@ def _safe_log(api_key: str, tool: str, inputs: dict, outcome: str, duration_ms: 
     except Exception as log_error:
         print(f"AUDIT LOG FAILURE: {log_error}", file=sys.stderr)
 
+
+# ── Permission helpers ──────────────────────────────────────────────
+
 def _get_permissions(claims: dict) -> dict:
     """
-    Looks up user permissions from Supabase.
-    Falls back to default permissions if user not found.
+    Look up user permissions from Supabase.
+    FAIL CLOSED. No row = FORBIDDEN. Never grant default access.
     """
     user_sub = claims.get("sub", "")
     perms = get_user_permissions(user_sub)
     if perms is None:
-        return {
-            "role": "viewer",
-            "allowed_tools": ["get_employee_status"],
-            "allowed_employees": None,
-        }
+        raise AuthError(
+            Errors.FORBIDDEN,
+            message="Your account is not authorised to use this service. "
+                    "Contact your administrator."
+        )
     return perms
 
 
 def _check_tool_permission(user_permissions: dict, tool_name: str) -> None:
-    allowed_tools = user_permissions.get("allowed_tools")
-    if allowed_tools is None:
-        return
+    allowed_tools = user_permissions.get("allowed_tools") or []
     if tool_name not in allowed_tools:
         raise AuthError(
             Errors.FORBIDDEN,
@@ -149,16 +148,24 @@ def _check_tool_permission(user_permissions: dict, tool_name: str) -> None:
 
 
 def _check_employee_permission(user_permissions: dict, employee_code: str) -> None:
-    allowed_employees = user_permissions.get("allowed_employees")
-    if allowed_employees is None:
-        return
-    if employee_code.upper() not in [e.upper() for e in allowed_employees]:
+    """
+    Resolve scope into the actual set of visible employee codes,
+    then check membership. Returns the same error for invisible-and-existent
+    as for non-existent — never leaks which case it is.
+    """
+    company_id = user_permissions["company_id"]
+    scope = user_permissions.get("scope") or "self"
+    user_emp = user_permissions.get("employee_code")
+
+    visible = get_visible_employee_codes(company_id, scope, user_emp)
+    if employee_code.upper() not in [c.upper() for c in visible]:
         raise AuthError(
             Errors.FORBIDDEN,
-            message=f"You do not have permission to view employee '{employee_code}'. "
-                    f"Contact your administrator for access."
+            message=f"You do not have permission to view employee '{employee_code}'."
         )
-# ── The single tool 
+
+
+# ── Tool 1 — get_employee_status ────────────────────────────────────
 
 @mcp.tool()
 def get_employee_status(
@@ -173,17 +180,10 @@ def get_employee_status(
     tasks completed, any blockers, and overall performance signal.
 
     Requires:
-    - employee_code : the employee's code (e.g. E001) or name (e.g. Mohit, Vaidehi Gupta)
+    - employee_code : the employee's code (e.g. E001) or name (e.g. Mohit)
 
     Authentication is handled automatically via the connection's
-    Bearer token — never ask the user for an API key or token.
-
-    Returns a structured response containing:
-    - Employee profile (name, department, joining date)
-    - Current activity (stage, focus score, hours, tasks, blockers)
-    - Performance signal (strong / steady / needs_attention / blocked / data_missing)
-    - Last active date
-    - data_warning if data is stale (> 7 days old) or hours look wrong
+    Bearer token — never ask the user for an API key.
 
     If the employee does not exist, returns EMPLOYEE_NOT_FOUND.
     If the employee exists but has no activity data, returns their
@@ -197,65 +197,46 @@ def get_employee_status(
     company_id = "unauthenticated"
 
     try:
-
-
-        # LAYER 2 — AUTHENTICATION (OAuth 2.1 / JWT)
-      
+        # LAYER 2 — AUTHENTICATION
         request = ctx.request_context.request
         request_headers = dict(request.headers) if request is not None else {}
         api_key = extract_bearer_token(request_headers)
         claims = verify_token(api_key)
 
-        # TEMPORARY DEBUG — remove after testing
-        if employee_code.upper() == "DEBUG":
-            return {
-                "debug": True,
-                "token_claims": {k: str(v) for k, v in claims.items()},
-            }
-    
-        # LAYER 3 — IDENTITY EXTRACTION
-  
-        company_id = claims.get("company_id") or claims.get("sub")
-        if not company_id:
+        # LAYER 3 — IDENTITY EXTRACTION (sub only; real company comes next)
+        user_sub = claims.get("sub")
+        if not user_sub:
             raise AuthError(
                 Errors.UNAUTHENTICATED,
                 message="Token is missing required identity claims."
             )
 
-    
-        # LAYER 3.5 — PERMISSION LOOKUP
-    
+        # LAYER 3.5 — PERMISSION LOOKUP (fail-closed, real company_id)
         user_permissions = _get_permissions(claims)
+        company_id = user_permissions["company_id"]
         _check_tool_permission(user_permissions, tool_name)
 
         # LAYER 3.6 — EMPLOYEE DATA SCOPING
-    
         _check_employee_permission(user_permissions, employee_code)
 
-        # LAYER 4 — RATE LIMITING
-        check_rate_limit(company_id)
+        # LAYER 4 — RATE LIMITING (per-user, not per-tenant)
+        check_rate_limit(user_sub)
 
-   
         # LAYER 5 — INPUT VALIDATION
-      
         validated = validate_input(
             EmployeeStatusInput,
             {"employee_code": employee_code}
         )
 
-     
-        # LAYER 6 — DATA FETCH (Google Sheets API)
-  
-        employee = get_employee_by_code(validated.employee_code)
-
-        # If not found by code, try searching by name
+        # LAYER 6 — DATA FETCH (tenant-scoped)
+        employee = get_employee_by_code(company_id, validated.employee_code)
         if not employee:
-            employee = get_employee_by_name(employee_code)
+            employee = get_employee_by_name(company_id, employee_code)
 
         if not employee:
             duration = int((time.time() - start_time) * 1000)
             _safe_log(
-                api_key=company_id,
+                api_key=user_sub,
                 tool=tool_name,
                 inputs={"employee_code": employee_code},
                 outcome=Errors.EMPLOYEE_NOT_FOUND.code,
@@ -267,14 +248,12 @@ def get_employee_status(
                         f"Please check the employee code and try again."
             )
 
-        activity = get_latest_activity_for_employee(validated.employee_code)
+        activity = get_latest_activity_for_employee(company_id, validated.employee_code)
 
-  
         # LAYER 7 — AUDIT LOGGING
-   
         duration = int((time.time() - start_time) * 1000)
         _safe_log(
-            api_key=company_id,
+            api_key=user_sub,
             tool=tool_name,
             inputs={"employee_code": employee_code},
             outcome="success",
@@ -282,7 +261,6 @@ def get_employee_status(
         )
 
         # LAYER 8 — RESPONSE SHAPING
-  
         base = {
             "employee_code": employee.get("employee_code", "").upper(),
             "name": employee.get("name", "Unknown"),
@@ -345,7 +323,7 @@ def get_employee_status(
 
         if hours_worked is None:
             response["data_warning"] = (
-                "Hours worked value appears incorrect — please check the sheet."
+                "Hours worked value appears incorrect — please check the data."
             )
 
         return response
@@ -377,6 +355,9 @@ def get_employee_status(
         _safe_log(api_key=company_id, tool=tool_name, inputs={"employee_code": employee_code}, outcome=Errors.INTERNAL_ERROR.code, duration_ms=duration)
         return _build_error_response(Errors.INTERNAL_ERROR)
 
+
+# ── Tool 2 — get_daily_brief ────────────────────────────────────────
+
 @mcp.tool()
 def get_daily_brief(
     employee_code: str,
@@ -386,20 +367,16 @@ def get_daily_brief(
     """
     Returns the detailed daily activity brief for one employee on a specific date.
 
-    Use this tool when someone asks about what an employee did on a particular day,
-    their activity on a specific date, or their daily summary.
+    Use this tool when someone asks about what an employee did on a particular
+    day, their activity on a specific date, or their daily summary.
 
     Requires:
     - employee_code : the employee's code (e.g. E001) or name (e.g. Mohit)
     - date : the date in YYYY-MM-DD format, e.g. 2026-07-01
 
-    Returns the employee's stage, focus score, hours worked, tasks completed,
-    blockers, and the daily brief summary for that specific date.
-
     If no activity is found for that date, returns a clear message.
 
     Never mention the tool name or internal function names to the user.
-    Present the data naturally as if you already know it.
     """
     start_time = time.time()
     tool_name = "get_daily_brief"
@@ -413,41 +390,41 @@ def get_daily_brief(
         claims = verify_token(api_key)
 
         # LAYER 3 — IDENTITY EXTRACTION
-        company_id = claims.get("company_id") or claims.get("sub")
-        if not company_id:
+        user_sub = claims.get("sub")
+        if not user_sub:
             raise AuthError(Errors.UNAUTHENTICATED, message="Token is missing required identity claims.")
 
         # LAYER 3.5 — PERMISSION LOOKUP
         user_permissions = _get_permissions(claims)
+        company_id = user_permissions["company_id"]
         _check_tool_permission(user_permissions, tool_name)
 
         # LAYER 3.6 — EMPLOYEE DATA SCOPING
         _check_employee_permission(user_permissions, employee_code)
 
         # LAYER 4 — RATE LIMITING
-        check_rate_limit(company_id)
+        check_rate_limit(user_sub)
 
         # LAYER 5 — INPUT VALIDATION
         validated = validate_input(DailyBriefInput, {"employee_code": employee_code, "date": date})
 
-        # LAYER 6 — DATA FETCH
-        employee = get_employee_by_code(validated.employee_code)
-
+        # LAYER 6 — DATA FETCH (tenant-scoped)
+        employee = get_employee_by_code(company_id, validated.employee_code)
         if not employee:
-            employee = get_employee_by_name(employee_code)
+            employee = get_employee_by_name(company_id, employee_code)
             if employee:
                 validated.employee_code = employee.get("employee_code", validated.employee_code)
 
         if not employee:
             duration = int((time.time() - start_time) * 1000)
-            _safe_log(api_key=company_id, tool=tool_name, inputs={"employee_code": employee_code}, outcome="EMPLOYEE_NOT_FOUND", duration_ms=duration)
+            _safe_log(api_key=user_sub, tool=tool_name, inputs={"employee_code": employee_code}, outcome="EMPLOYEE_NOT_FOUND", duration_ms=duration)
             return _build_error_response(Errors.EMPLOYEE_NOT_FOUND, message=f"No employee found with code '{validated.employee_code}'.")
 
-        activity = get_activity_for_date(validated.employee_code, validated.date)
+        activity = get_activity_for_date(company_id, validated.employee_code, validated.date)
 
         # LAYER 7 — AUDIT LOGGING
         duration = int((time.time() - start_time) * 1000)
-        _safe_log(api_key=company_id, tool=tool_name, inputs={"employee_code": employee_code, "date": date}, outcome="success", duration_ms=duration)
+        _safe_log(api_key=user_sub, tool=tool_name, inputs={"employee_code": employee_code, "date": date}, outcome="success", duration_ms=duration)
 
         # LAYER 8 — RESPONSE SHAPING
         if not activity:
@@ -507,6 +484,9 @@ def get_daily_brief(
         return _build_error_response(Errors.INTERNAL_ERROR)
 
 
+
+# ── Tool 3 — get_top_performers ─────────────────────────────────────
+
 @mcp.tool()
 def get_top_performers(
     period: str,
@@ -515,21 +495,20 @@ def get_top_performers(
     """
     Returns employees ranked by performance for a given period.
 
-    Use this when someone asks who performed best, who are the top
-    performers, or who had the highest scores.
+    Use this when someone asks who performed best, who are the top performers,
+    or who had the highest scores.
 
     Requires:
     - period : one of "daily", "weekly", "monthly", or a specific date like "2026-07-16"
-      - daily = today only
-      - weekly = last 7 days
-      - monthly = last 30 days
-      - YYYY-MM-DD = that specific date only
 
-    Returns a ranked list of employees sorted by performance score.
+    Returns a ranked list sorted by performance_score = avg_focus*0.6 + avg_tasks*0.4.
     Permission-aware: viewers only see rankings for employees they have access to.
+
     Never mention tool names or internal function names to the user.
-    Present the data naturally.
     """
+    start_time = time.time()
+    tool_name = "get_top_performers"
+    company_id = "unauthenticated"
 
     try:
         # LAYER 2 — AUTHENTICATION
@@ -539,21 +518,32 @@ def get_top_performers(
         claims = verify_token(api_key)
 
         # LAYER 3 — IDENTITY EXTRACTION
-        company_id = claims.get("company_id") or claims.get("sub")
-        if not company_id:
+        user_sub = claims.get("sub")
+        if not user_sub:
             raise AuthError(Errors.UNAUTHENTICATED, message="Token is missing required identity claims.")
 
         # LAYER 3.5 — PERMISSION LOOKUP
         user_permissions = _get_permissions(claims)
+        company_id = user_permissions["company_id"]
         _check_tool_permission(user_permissions, tool_name)
 
+        # LAYER 3.6 — VISIBILITY FOR AGGREGATION
+        # scope=all -> no filter (all tenant employees). Any other scope -> restrict.
+        scope = user_permissions.get("scope") or "self"
+        user_emp = user_permissions.get("employee_code")
+
+        if scope == "all":
+            visible_codes = None
+        else:
+            visible_codes = get_visible_employee_codes(company_id, scope, user_emp)
+
         # LAYER 4 — RATE LIMITING
-        check_rate_limit(company_id)
+        check_rate_limit(user_sub)
 
         # LAYER 5 — INPUT VALIDATION
         validated = validate_input(TopPerformersInput, {"period": period})
 
-        # LAYER 6 — DATE RANGE CALCULATION + DATA FETCH
+        # ── Date range calculation (before Layer 6 fetch)
         from datetime import timedelta
         today = datetime.now(timezone.utc).date()
         period_label = validated.period.lower().strip()
@@ -568,7 +558,6 @@ def get_top_performers(
             start_date = today - timedelta(days=30)
             end_date = today
         else:
-            # Treat as a specific date
             try:
                 specific_date = datetime.strptime(period_label, "%Y-%m-%d").date()
                 start_date = specific_date
@@ -579,16 +568,17 @@ def get_top_performers(
                     message=f"Invalid period '{validated.period}'. Use 'daily', 'weekly', 'monthly', or a date like '2026-07-16'."
                 )
 
-        rows = fetch_top_performers(str(start_date), str(end_date))
-
-        # Filter by employee permissions
-        allowed_employees = user_permissions.get("allowed_employees")
-        if allowed_employees is not None:
-            rows = [r for r in rows if r.get("employee_code", "").upper() in [e.upper() for e in allowed_employees]]
+        # LAYER 6 — DATA FETCH (tenant-scoped + visibility-scoped)
+        rows = fetch_top_performers(
+            company_id,
+            str(start_date),
+            str(end_date),
+            visible_codes=visible_codes,
+        )
 
         if not rows:
             duration = int((time.time() - start_time) * 1000)
-            _safe_log(api_key=company_id, tool=tool_name, inputs={"period": period}, outcome="no_data", duration_ms=duration)
+            _safe_log(api_key=user_sub, tool=tool_name, inputs={"period": period}, outcome="no_data", duration_ms=duration)
             return {
                 "period": validated.period,
                 "start_date": str(start_date),
@@ -597,7 +587,11 @@ def get_top_performers(
                 "rankings": [],
             }
 
-        # LAYER 8 — AGGREGATE AND RANK
+        # LAYER 7 — AUDIT LOGGING
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=user_sub, tool=tool_name, inputs={"period": period}, outcome="success", duration_ms=duration)
+
+        # LAYER 8 — RESPONSE SHAPING (aggregate + rank)
         from collections import defaultdict
         employee_stats = defaultdict(lambda: {
             "total_focus": 0, "total_tasks": 0, "total_hours": 0,
@@ -635,13 +629,11 @@ def get_top_performers(
                 "performance_score": performance_score,
             })
 
-        rankings.sort(key=lambda x: x["performance_score"], reverse=True)
+        # Sort by score desc; break ties deterministically by employee_code
+        # so E005 and E006 always come back in the same order.
+        rankings.sort(key=lambda x: (-x["performance_score"], x["employee_code"]))
         for i, r in enumerate(rankings):
             r["rank"] = i + 1
-
-        # LAYER 7 — AUDIT LOGGING
-        duration = int((time.time() - start_time) * 1000)
-        _safe_log(api_key=company_id, tool=tool_name, inputs={"period": period}, outcome="success", duration_ms=duration)
 
         return {
             "period": validated.period,
@@ -678,7 +670,8 @@ def get_top_performers(
         _safe_log(api_key=company_id, tool=tool_name, inputs={"period": period}, outcome=Errors.INTERNAL_ERROR.code, duration_ms=duration)
         return _build_error_response(Errors.INTERNAL_ERROR)
 
-# ── OAuth endpoints ───────────────────────────────────────────────────
+
+# ── OAuth endpoints ─────────────────────────────────────────────────
 
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
 async def discovery(request):
@@ -696,6 +689,7 @@ async def discovery(request):
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "none"],
     })
 
+
 @mcp.custom_route("/oauth/register", methods=["POST"])
 async def oauth_register(request):
     from starlette.responses import JSONResponse
@@ -707,6 +701,7 @@ async def oauth_register(request):
         "client_id_issued_at": 0,
         "client_secret_expires_at": 0,
     })
-    
+
+
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
