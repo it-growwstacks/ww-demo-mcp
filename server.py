@@ -150,11 +150,23 @@ def _check_tool_permission(user_permissions: dict, tool_name: str) -> None:
 def _check_employee_permission(user_permissions: dict, employee_code: str) -> None:
     """
     Resolve scope into the actual set of visible employee codes,
-    then check membership. Returns the same error for invisible-and-existent
-    as for non-existent — never leaks which case it is.
+    then check membership.
+
+    For scope='all' (admins), we skip this check entirely — they can see
+    every employee in their tenant, so a non-existent code should return
+    a plain "not found" instead of the misleading "forbidden".
+
+    For any other scope, we return FORBIDDEN uniformly whether the employee
+    is invisible or non-existent — never leaks which case it is.
     """
-    company_id = user_permissions["company_id"]
     scope = user_permissions.get("scope") or "self"
+
+    # Admins with scope='all' don't get scoped. Layer 6 will handle
+    # "employee not found" naturally.
+    if scope == "all":
+        return
+
+    company_id = user_permissions["company_id"]
     user_emp = user_permissions.get("employee_code")
 
     visible = get_visible_employee_codes(company_id, scope, user_emp)
@@ -484,6 +496,376 @@ def get_daily_brief(
         return _build_error_response(Errors.INTERNAL_ERROR)
 
 
+# ── Tool 4 — get_team_summary ───────────────────────────────────────
+
+@mcp.tool()
+def get_team_summary(
+    ctx: Context
+) -> dict:
+    """
+    Returns a summary of the current status for every employee the caller
+    can see, based on their scope.
+
+    Use this when someone asks about their whole team, their department, or
+    their reports — questions like "how is my team doing?", "who's blocked?",
+    "give me a snapshot of everyone".
+
+    For an admin (scope='all'): returns the whole company.
+    For a manager (scope='direct_reports'): returns them + their direct reports.
+    For a department lead (scope='department'): returns everyone in their dept.
+    For an individual (scope='self'): returns just themselves.
+
+    No parameters — the caller's identity determines who is included.
+
+    Each employee's entry includes their latest activity: stage, focus score,
+    tasks completed, blockers, performance signal, and whether their data is
+    stale.
+
+    Never mention the tool name or internal function names to the user.
+    """
+    start_time = time.time()
+    tool_name = "get_team_summary"
+    company_id = "unauthenticated"
+
+    try:
+        # LAYER 2 — AUTHENTICATION
+        request = ctx.request_context.request
+        request_headers = dict(request.headers) if request is not None else {}
+        api_key = extract_bearer_token(request_headers)
+        claims = verify_token(api_key)
+
+        # LAYER 3 — IDENTITY EXTRACTION
+        user_sub = claims.get("sub")
+        if not user_sub:
+            raise AuthError(Errors.UNAUTHENTICATED, message="Token is missing required identity claims.")
+
+        # LAYER 3.5 — PERMISSION LOOKUP
+        user_permissions = _get_permissions(claims)
+        company_id = user_permissions["company_id"]
+        _check_tool_permission(user_permissions, tool_name)
+
+        # LAYER 3.6 — VISIBILITY (which employees can this caller see?)
+        scope = user_permissions.get("scope") or "self"
+        user_emp = user_permissions.get("employee_code")
+        visible_codes = get_visible_employee_codes(company_id, scope, user_emp)
+
+        # LAYER 4 — RATE LIMITING
+        check_rate_limit(user_sub)
+
+        # LAYER 5 — INPUT VALIDATION
+        # No inputs to validate. The caller's identity is the only input.
+
+        # LAYER 6 — DATA FETCH
+        # For each visible employee: fetch profile + latest activity.
+        # Skip employees the caller can't see (visible_codes already handles this).
+        if not visible_codes:
+            duration = int((time.time() - start_time) * 1000)
+            _safe_log(api_key=user_sub, tool=tool_name, inputs={}, outcome="no_visible_employees", duration_ms=duration)
+            return {
+                "team_size": 0,
+                "message": "No employees are in your visibility scope.",
+                "employees": [],
+            }
+
+        team = []
+        for code in visible_codes:
+            employee = get_employee_by_code(company_id, code)
+            if not employee:
+                continue  # skip if lookup failed for any reason
+
+            activity = get_latest_activity_for_employee(company_id, code)
+
+            entry = {
+                "employee_code": employee.get("employee_code", "").upper(),
+                "name": employee.get("name", "Unknown"),
+                "department": employee.get("department", "Unknown"),
+            }
+
+            if not activity:
+                entry["status"] = "no_activity_data"
+                entry["message"] = "No activity recorded yet."
+            else:
+                focus_score = _parse_focus_score(activity.get("focus_score"))
+                hours_worked = _parse_hours(activity.get("hours_worked"))
+                tasks_completed = _parse_int(activity.get("tasks_completed"), default=0)
+                raw_blockers = (activity.get("blockers") or "").strip()
+                blockers = "None" if raw_blockers.lower() in NO_BLOCKER_VALUES else raw_blockers
+
+                entry.update({
+                    "status": "active",
+                    "current_stage": activity.get("stage") or "Not recorded",
+                    "focus_score": focus_score,
+                    "hours_worked": hours_worked,
+                    "tasks_completed": tasks_completed,
+                    "blockers": blockers,
+                    "last_active_date": activity.get("date", "Unknown"),
+                    "performance_signal": _compute_performance_signal(
+                        focus_score=focus_score,
+                        tasks_completed=tasks_completed,
+                        blockers=blockers,
+                    ),
+                })
+
+                # Staleness warning (data > 7 days old)
+                try:
+                    last_date = dt.strptime(activity.get("date", ""), "%Y-%m-%d")
+                    days_old = (dt.now() - last_date).days
+                    if days_old > 7:
+                        entry["data_warning"] = f"Data is {days_old} days old."
+                except (ValueError, TypeError):
+                    pass
+
+            team.append(entry)
+
+        # Sort team: blocked first (need attention), then by performance signal
+        signal_priority = {
+            "blocked": 0,
+            "needs_attention": 1,
+            "data_missing": 2,
+            "steady": 3,
+            "strong": 4,
+            None: 5,
+        }
+        team.sort(key=lambda e: (
+            signal_priority.get(e.get("performance_signal"), 6),
+            e["employee_code"],
+        ))
+
+        # LAYER 7 — AUDIT LOGGING
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=user_sub, tool=tool_name, inputs={}, outcome="success", duration_ms=duration)
+
+        # LAYER 8 — RESPONSE SHAPING
+        # Count summary flags for a quick top-line
+        blocked_count = sum(1 for e in team if e.get("performance_signal") == "blocked")
+        needs_attention_count = sum(1 for e in team if e.get("performance_signal") == "needs_attention")
+        no_data_count = sum(1 for e in team if e.get("status") == "no_activity_data")
+
+        return {
+            "team_size": len(team),
+            "summary": {
+                "blocked": blocked_count,
+                "needs_attention": needs_attention_count,
+                "no_activity_data": no_data_count,
+            },
+            "employees": team,
+        }
+
+    except AuthError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key="unauthenticated", tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        return _build_error_response(e.error, message=e.message)
+
+    except RateLimitError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        response = _build_error_response(e.error)
+        response["retry_after_seconds"] = e.retry_after
+        return response
+
+    except SheetsError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        return _build_error_response(e.error, message=e.message)
+
+    except Exception:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=Errors.INTERNAL_ERROR.code, duration_ms=duration)
+        return _build_error_response(Errors.INTERNAL_ERROR)
+
+# ── Tool 5 — get_department_stats ───────────────────────────────────
+
+@mcp.tool()
+def get_department_stats(
+    period: str,
+    ctx: Context
+) -> dict:
+    """
+    Returns aggregated performance metrics per department for a given period.
+
+    Use this when someone asks how departments compare — questions like
+    "how is Engineering doing vs Sales?", "which department is most productive
+    this month?", or "give me a department breakdown".
+
+    Requires:
+    - period : one of "daily", "weekly", "monthly", or a specific date like "2026-07-16"
+
+    For each department the caller can see:
+      - employee count (active)
+      - average focus score
+      - average tasks per day
+      - total tasks completed
+      - number of employees with blockers
+
+    Departments with zero employees are still included so the picture is complete.
+    Scope-aware: a department lead only sees their own department.
+
+    Never mention the tool name or internal function names to the user.
+    """
+    start_time = time.time()
+    tool_name = "get_department_stats"
+    company_id = "unauthenticated"
+
+    try:
+        # LAYER 2 — AUTHENTICATION
+        request = ctx.request_context.request
+        request_headers = dict(request.headers) if request is not None else {}
+        api_key = extract_bearer_token(request_headers)
+        claims = verify_token(api_key)
+
+        # LAYER 3 — IDENTITY EXTRACTION
+        user_sub = claims.get("sub")
+        if not user_sub:
+            raise AuthError(Errors.UNAUTHENTICATED, message="Token is missing required identity claims.")
+
+        # LAYER 3.5 — PERMISSION LOOKUP
+        user_permissions = _get_permissions(claims)
+        company_id = user_permissions["company_id"]
+        _check_tool_permission(user_permissions, tool_name)
+
+        # LAYER 3.6 — VISIBILITY
+        scope = user_permissions.get("scope") or "self"
+        user_emp = user_permissions.get("employee_code")
+        visible_codes = get_visible_employee_codes(company_id, scope, user_emp)
+
+        # LAYER 4 — RATE LIMITING
+        check_rate_limit(user_sub)
+
+        # LAYER 5 — INPUT VALIDATION
+        # We validate period manually here since it's the same format as get_top_performers
+        period_label = period.lower().strip()
+
+        # LAYER 6 — DATE RANGE
+        from datetime import timedelta
+        today = datetime.now(timezone.utc).date()
+
+        if period_label == "daily":
+            start_date = today
+            end_date = today
+        elif period_label == "weekly":
+            start_date = today - timedelta(days=7)
+            end_date = today
+        elif period_label == "monthly":
+            start_date = today - timedelta(days=30)
+            end_date = today
+        else:
+            try:
+                specific_date = datetime.strptime(period_label, "%Y-%m-%d").date()
+                start_date = specific_date
+                end_date = specific_date
+            except ValueError:
+                return _build_error_response(
+                    Errors.INVALID_PARAMETER,
+                    message=f"Invalid period '{period}'. Use 'daily', 'weekly', 'monthly', or a date like '2026-07-16'."
+                )
+
+        # LAYER 6 — DATA FETCH (activity within scope + period)
+        if not visible_codes and scope != "all":
+            # No visible employees for this user
+            duration = int((time.time() - start_time) * 1000)
+            _safe_log(api_key=user_sub, tool=tool_name, inputs={"period": period}, outcome="no_visible_employees", duration_ms=duration)
+            return {
+                "period": period,
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+                "departments": [],
+                "message": "No departments in your visibility scope.",
+            }
+
+        # For scope='all', pass None to get all tenant activity
+        codes_filter = None if scope == "all" else visible_codes
+        activity_rows = fetch_top_performers(
+            company_id,
+            str(start_date),
+            str(end_date),
+            visible_codes=codes_filter,
+        )
+
+        # LAYER 7 — AUDIT LOGGING
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=user_sub, tool=tool_name, inputs={"period": period}, outcome="success", duration_ms=duration)
+
+        # LAYER 8 — RESPONSE SHAPING (aggregate by department)
+        from collections import defaultdict
+        dept_stats = defaultdict(lambda: {
+            "total_focus": 0,
+            "total_tasks": 0,
+            "days_logged": 0,
+            "employees": set(),
+            "employees_with_blockers": set(),
+        })
+
+        for row in activity_rows:
+            emp_info = row.get("employees") or {}
+            dept_name = emp_info.get("department") or "Unknown"
+            code = row.get("employee_code", "").upper()
+
+            stats = dept_stats[dept_name]
+            focus = row.get("focus_score")
+            if focus is not None:
+                stats["total_focus"] += focus
+                stats["days_logged"] += 1
+            stats["total_tasks"] += (row.get("tasks_completed") or 0)
+            stats["employees"].add(code)
+
+            blockers = (row.get("blockers") or "").strip().lower()
+            if blockers and blockers not in NO_BLOCKER_VALUES:
+                stats["employees_with_blockers"].add(code)
+
+        # Build the response — one row per department
+        departments = []
+        for name, stats in dept_stats.items():
+            days = stats["days_logged"]
+            avg_focus = round(stats["total_focus"] / days, 1) if days > 0 else None
+            emp_count = len(stats["employees"])
+            avg_tasks_per_employee = round(stats["total_tasks"] / emp_count, 1) if emp_count > 0 else 0
+
+            departments.append({
+                "department": name,
+                "active_employees": emp_count,
+                "avg_focus_score": avg_focus,
+                "avg_tasks_per_employee": avg_tasks_per_employee,
+                "total_tasks_completed": stats["total_tasks"],
+                "employees_with_blockers": len(stats["employees_with_blockers"]),
+                "days_of_data": days,
+            })
+
+        # Sort by avg_focus descending, NULLs last, ties by department name
+        departments.sort(key=lambda d: (
+            d["avg_focus_score"] is None,
+            -(d["avg_focus_score"] or 0),
+            d["department"],
+        ))
+
+        return {
+            "period": period,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "department_count": len(departments),
+            "departments": departments,
+        }
+
+    except AuthError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key="unauthenticated", tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        return _build_error_response(e.error, message=e.message)
+
+    except RateLimitError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={"period": period}, outcome=e.error.code, duration_ms=duration)
+        response = _build_error_response(e.error)
+        response["retry_after_seconds"] = e.retry_after
+        return response
+
+    except SheetsError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={"period": period}, outcome=e.error.code, duration_ms=duration)
+        return _build_error_response(e.error, message=e.message)
+
+    except Exception:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={"period": period}, outcome=Errors.INTERNAL_ERROR.code, duration_ms=duration)
+        return _build_error_response(Errors.INTERNAL_ERROR)
 
 # ── Tool 3 — get_top_performers ─────────────────────────────────────
 
