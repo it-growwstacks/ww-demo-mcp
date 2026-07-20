@@ -106,6 +106,36 @@ class TopPerformersInput(BaseModel):
         return v.strip()
 
 
+class AttendanceInput(BaseModel):
+    """Input for get_attendance_overview."""
+    period: str = Field(
+        min_length=1,
+        max_length=30,
+        description=(
+            "Period: 'daily', 'weekly', 'monthly', a specific date like "
+            "'2026-07-16', or a range like '2026-07-01 to 2026-07-16'."
+        ),
+    )
+    employee_code: str = Field(
+        default="",
+        max_length=60,
+        description=(
+            "Optional. If given, show attendance only for this employee "
+            "(code or name). If omitted, shows the whole team."
+        ),
+    )
+
+    @field_validator("period")
+    @classmethod
+    def strip_period(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("employee_code")
+    @classmethod
+    def strip_employee_code(cls, v: str) -> str:
+        return v.strip()
+
+
 # ── Validation entry point used by server.py ─────────────────────────
 
 class ValidationError(Exception):

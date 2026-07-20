@@ -421,3 +421,141 @@ def get_top_performers(
     except Exception as e:
         _log.error(f"Supabase top performers query failed: {e}")
         raise SheetsError(Errors.SHEETS_UNAVAILABLE, message=str(e))
+
+def get_attendance_data(
+    company_id: str,
+    start_date: str,
+    end_date: str,
+    visible_codes: list[str] | None = None,
+    employee_code: str | None = None,
+) -> dict:
+    """
+    Returns attendance picture for the given period:
+      - approved leave records (from time_off table)
+      - dates each employee had activity logged
+      - enough to compute unexplained gaps
+
+    If employee_code is given, only that employee is returned.
+    If visible_codes is given, only those employees are included.
+    If both are given, employee_code must be in visible_codes (caller
+    checks this before calling).
+
+    Returns a dict keyed by employee_code:
+    {
+        "E002": {
+            "name": "Vaidehi Gupta",
+            "department": "Engineering",
+            "leave_records": [
+                {
+                    "start_date": "2026-07-06",
+                    "end_date": "2026-07-10",
+                    "type": "vacation",
+                    "status": "approved",
+                }
+            ],
+            "active_dates": ["2026-07-01", "2026-07-02", ...],
+        },
+        ...
+    }
+    """
+    try:
+        # Step 1 — determine which employees to include
+        if employee_code:
+            codes = [employee_code.upper()]
+        elif visible_codes is not None:
+            codes = [c.upper() for c in visible_codes]
+        else:
+            # scope=all: fetch all active employees in the tenant
+            all_emp = (
+                _supabase.table("employees")
+                .select("employee_code")
+                .eq("company_id", company_id)
+                .eq("is_active", True)
+                .execute()
+            )
+            codes = [r["employee_code"] for r in (all_emp.data or [])]
+
+        if not codes:
+            return {}
+
+        # Step 2 — fetch employee profiles (name + department)
+        emp_result = (
+            _supabase.table("employees")
+            .select("employee_code, name, department_id")
+            .eq("company_id", company_id)
+            .in_("employee_code", codes)
+            .execute()
+        )
+        emp_rows = emp_result.data or []
+
+        # Resolve department names
+        dept_ids = list({
+            e["department_id"] for e in emp_rows if e.get("department_id")
+        })
+        dept_map = {}
+        if dept_ids:
+            dept_result = (
+                _supabase.table("departments")
+                .select("department_id, name")
+                .eq("company_id", company_id)
+                .in_("department_id", dept_ids)
+                .execute()
+            )
+            dept_map = {
+                d["department_id"]: d["name"]
+                for d in (dept_result.data or [])
+            }
+
+        # Build the employee map
+        emp_map = {}
+        for e in emp_rows:
+            emp_map[e["employee_code"]] = {
+                "name": e.get("name", "Unknown"),
+                "department": dept_map.get(e.get("department_id"), "Unknown"),
+                "leave_records": [],
+                "active_dates": [],
+            }
+
+        # Step 3 — fetch approved leave records for this period
+        leave_query = (
+            _supabase.table("time_off")
+            .select("employee_code, start_date, end_date, type, status")
+            .eq("company_id", company_id)
+            .eq("status", "approved")
+            .in_("employee_code", codes)
+            # Overlap condition: leave that touches our window
+            # leave.start <= end_date AND leave.end >= start_date
+            .lte("start_date", end_date)
+            .gte("end_date", start_date)
+            .execute()
+        )
+        for row in (leave_query.data or []):
+            code = row["employee_code"]
+            if code in emp_map:
+                emp_map[code]["leave_records"].append({
+                    "start_date": str(row["start_date"]),
+                    "end_date": str(row["end_date"]),
+                    "type": row["type"],
+                    "status": row["status"],
+                })
+
+        # Step 4 — fetch dates with activity in the period
+        activity_query = (
+            _supabase.table("daily_activity")
+            .select("employee_code, date")
+            .eq("company_id", company_id)
+            .in_("employee_code", codes)
+            .gte("date", start_date)
+            .lte("date", end_date)
+            .execute()
+        )
+        for row in (activity_query.data or []):
+            code = row["employee_code"]
+            if code in emp_map:
+                emp_map[code]["active_dates"].append(str(row["date"]))
+
+        return emp_map
+
+    except Exception as e:
+        _log.error(f"Supabase attendance query failed: {e}")
+        raise SheetsError(Errors.SHEETS_UNAVAILABLE, message=str(e))

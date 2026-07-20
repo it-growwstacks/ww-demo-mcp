@@ -20,7 +20,7 @@ from mcp.server.fastmcp import FastMCP, Context
 
 from auth import verify_token, extract_bearer_token, AuthError
 from rate_limiter import check_rate_limit, RateLimitError
-from validators import validate_input, ValidationError, EmployeeStatusInput, DailyBriefInput, TopPerformersInput
+from validators import validate_input, ValidationError, EmployeeStatusInput, DailyBriefInput, TopPerformersInput, AttendanceInput
 from supabase_client import (
     get_employee_by_code,
     get_employee_by_name,
@@ -29,6 +29,7 @@ from supabase_client import (
     get_activity_for_date,
     get_top_performers as fetch_top_performers,
     get_visible_employee_codes,
+    get_attendance_data,
     SheetsError,
 )
 from audit_logger import log_tool_call
@@ -865,6 +866,321 @@ def get_department_stats(
     except Exception:
         duration = int((time.time() - start_time) * 1000)
         _safe_log(api_key=company_id, tool=tool_name, inputs={"period": period}, outcome=Errors.INTERNAL_ERROR.code, duration_ms=duration)
+        return _build_error_response(Errors.INTERNAL_ERROR)
+
+# ── Tool 6 — get_attendance_overview ────────────────────────────────
+
+@mcp.tool()
+def get_attendance_overview(
+    period: str,
+    employee_code: str = "",
+    ctx: Context = None,
+) -> dict:
+    """
+    Returns an attendance overview for the given period — approved leave
+    records AND unexplained activity gaps for each employee.
+
+    Use this when someone asks:
+    - "Who's been out?"
+    - "Is Vaidehi on leave?"
+    - "Why is there no data for John?"
+    - "Who has unexplained gaps this week?"
+    - "Show me the attendance picture for my team"
+
+    This tool turns a plain 'no activity' answer into a meaningful one:
+    either the employee was on approved leave (and the reason is shown),
+    or the gap is genuinely unexplained (and flagged for attention).
+
+    Requires:
+    - period : "daily", "weekly", "monthly", a date like "2026-07-16",
+               or a range like "2026-07-01 to 2026-07-16"
+
+    Optional:
+    - employee_code : if given, show only that employee (code or name).
+                     If omitted, shows the whole visible team.
+
+    Returns for each employee:
+    - approved leave records (dates, type)
+    - whether any working days in the period have no activity AND no leave
+    - a clear status: on_leave / active / gap_unexplained / no_data
+
+    Never mention the tool name or internal function names to the user.
+    """
+    start_time = time.time()
+    tool_name = "get_attendance_overview"
+    company_id = "unauthenticated"
+
+    try:
+        # LAYER 2 — AUTHENTICATION
+        request = ctx.request_context.request
+        request_headers = dict(request.headers) if request is not None else {}
+        api_key = extract_bearer_token(request_headers)
+        claims = verify_token(api_key)
+
+        # LAYER 3 — IDENTITY EXTRACTION
+        user_sub = claims.get("sub")
+        if not user_sub:
+            raise AuthError(
+                Errors.UNAUTHENTICATED,
+                message="Token is missing required identity claims."
+            )
+
+        # LAYER 3.5 — PERMISSION LOOKUP
+        user_permissions = _get_permissions(claims)
+        company_id = user_permissions["company_id"]
+        _check_tool_permission(user_permissions, tool_name)
+
+        # LAYER 3.6 — VISIBILITY
+        scope = user_permissions.get("scope") or "self"
+        user_emp = user_permissions.get("employee_code")
+
+        if scope == "all":
+            visible_codes = None     # no filter — all tenant employees
+        else:
+            visible_codes = get_visible_employee_codes(company_id, scope, user_emp)
+
+        # LAYER 4 — RATE LIMITING
+        check_rate_limit(user_sub)
+
+        # LAYER 5 — INPUT VALIDATION
+        validated = validate_input(
+            AttendanceInput,
+            {"period": period, "employee_code": employee_code}
+        )
+
+        # ── Date range resolution (same pattern as other tools)
+        from datetime import timedelta
+        today = datetime.now(timezone.utc).date()
+        period_label = validated.period.lower().strip()
+
+        if period_label == "daily":
+            start_date = today
+            end_date = today
+        elif period_label == "weekly":
+            start_date = today - timedelta(days=7)
+            end_date = today
+        elif period_label == "monthly":
+            start_date = today - timedelta(days=30)
+            end_date = today
+        elif " to " in period_label:
+            try:
+                left, right = [p.strip() for p in period_label.split(" to ", 1)]
+                start_date = datetime.strptime(left, "%Y-%m-%d").date()
+                end_date = datetime.strptime(right, "%Y-%m-%d").date()
+                if start_date > end_date:
+                    return _build_error_response(
+                        Errors.INVALID_PARAMETER,
+                        message=f"Start date '{left}' is after end date '{right}'."
+                    )
+            except ValueError:
+                return _build_error_response(
+                    Errors.INVALID_PARAMETER,
+                    message=f"Invalid range '{validated.period}'. Use 'YYYY-MM-DD to YYYY-MM-DD'."
+                )
+        else:
+            try:
+                specific_date = datetime.strptime(period_label, "%Y-%m-%d").date()
+                start_date = specific_date
+                end_date = specific_date
+            except ValueError:
+                return _build_error_response(
+                    Errors.INVALID_PARAMETER,
+                    message=(
+                        f"Invalid period '{validated.period}'. Use 'daily', "
+                        f"'weekly', 'monthly', a date like '2026-07-16', or "
+                        f"a range like '2026-07-01 to 2026-07-16'."
+                    )
+                )
+
+        # ── If a specific employee was requested, check permission first
+        target_code = validated.employee_code.strip().upper() if validated.employee_code else None
+        resolved_code = None     # will be the actual employee_code after lookup
+
+        if target_code:
+            # Could be a code or a name — try code first
+            emp = get_employee_by_code(company_id, target_code)
+            if not emp:
+                emp = get_employee_by_name(company_id, validated.employee_code)
+            if not emp:
+                return _build_error_response(
+                    Errors.EMPLOYEE_NOT_FOUND,
+                    message=f"No employee found matching '{validated.employee_code}'."
+                )
+            resolved_code = emp["employee_code"].upper()
+
+            # Check visibility — same logic as other tools
+            if scope != "all":
+                if resolved_code not in [c.upper() for c in (visible_codes or [])]:
+                    raise AuthError(
+                        Errors.FORBIDDEN,
+                        message=f"You do not have permission to view employee '{validated.employee_code}'."
+                    )
+
+        # LAYER 6 — DATA FETCH
+        emp_map = get_attendance_data(
+            company_id=company_id,
+            start_date=str(start_date),
+            end_date=str(end_date),
+            visible_codes=visible_codes,
+            employee_code=resolved_code,
+        )
+
+        # LAYER 7 — AUDIT LOGGING
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(
+            api_key=user_sub,
+            tool=tool_name,
+            inputs={"period": period, "employee_code": employee_code},
+            outcome="success",
+            duration_ms=duration,
+        )
+
+        # LAYER 8 — RESPONSE SHAPING
+        # For each employee, compute:
+        #   - working days in the period
+        #   - days covered by approved leave
+        #   - days with activity
+        #   - unexplained gap days (working, no leave, no activity)
+        from datetime import timedelta as td
+
+        def _working_days(start, end):
+            """Return list of weekday dates between start and end inclusive."""
+            days = []
+            current = start
+            while current <= end:
+                if current.weekday() < 5:  # Monday=0 … Friday=4
+                    days.append(current)
+                current += td(days=1)
+            return days
+
+        def _dates_on_leave(leave_records, working_days_set):
+            """Return set of working days covered by approved leave."""
+            on_leave = set()
+            for leave in leave_records:
+                ls = datetime.strptime(leave["start_date"], "%Y-%m-%d").date()
+                le = datetime.strptime(leave["end_date"], "%Y-%m-%d").date()
+                current = ls
+                while current <= le:
+                    if current in working_days_set:
+                        on_leave.add(current)
+                    current += td(days=1)
+            return on_leave
+
+        working_days = _working_days(start_date, end_date)
+        working_days_set = set(working_days)
+        total_working_days = len(working_days)
+
+        employees_out = []
+
+        for code, data in emp_map.items():
+            active_dates_set = {
+                datetime.strptime(d, "%Y-%m-%d").date()
+                for d in data["active_dates"]
+            }
+            leave_dates_set = _dates_on_leave(data["leave_records"], working_days_set)
+
+            days_active = len(active_dates_set & working_days_set)
+            days_on_leave = len(leave_dates_set)
+
+            # Unexplained gap: working day, not on leave, no activity logged
+            unexplained = [
+                d for d in working_days
+                if d not in active_dates_set
+                and d not in leave_dates_set
+            ]
+            unexplained_count = len(unexplained)
+
+            # Determine overall status
+            if unexplained_count == total_working_days:
+                # No activity at all during period
+                if data["leave_records"]:
+                    status = "on_leave"
+                else:
+                    status = "no_data"
+            elif unexplained_count > 0:
+                status = "gap_unexplained"
+            else:
+                status = "active"
+
+            entry = {
+                "employee_code": code,
+                "name": data["name"],
+                "department": data["department"],
+                "status": status,
+                "days_active": days_active,
+                "days_on_leave": days_on_leave,
+                "unexplained_gap_days": unexplained_count,
+                "total_working_days_in_period": total_working_days,
+            }
+
+            # Attach leave records if any
+            if data["leave_records"]:
+                entry["leave_records"] = data["leave_records"]
+
+            # Attach unexplained gap dates if any (limit to 10 to keep response size sane)
+            if unexplained:
+                entry["unexplained_dates"] = [
+                    str(d) for d in sorted(unexplained)[:10]
+                ]
+                if unexplained_count > 10:
+                    entry["unexplained_dates_note"] = (
+                        f"{unexplained_count} total gap days — showing first 10."
+                    )
+
+            employees_out.append(entry)
+
+        # Sort: biggest unexplained gap first (most needs attention),
+        # then alphabetically by name
+        employees_out.sort(key=lambda e: (
+            -e["unexplained_gap_days"],
+            e["name"],
+        ))
+
+        # Top-line summary counts
+        on_leave_count = sum(1 for e in employees_out if e["status"] == "on_leave")
+        gap_count = sum(1 for e in employees_out if e["status"] == "gap_unexplained")
+        no_data_count = sum(1 for e in employees_out if e["status"] == "no_data")
+        active_count = sum(1 for e in employees_out if e["status"] == "active")
+
+        return {
+            "period": validated.period,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "total_working_days": total_working_days,
+            "summary": {
+                "active": active_count,
+                "on_leave": on_leave_count,
+                "unexplained_gaps": gap_count,
+                "no_data": no_data_count,
+            },
+            "employees": employees_out,
+        }
+
+    except AuthError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key="unauthenticated", tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        return _build_error_response(e.error, message=e.message)
+
+    except RateLimitError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        response = _build_error_response(e.error)
+        response["retry_after_seconds"] = e.retry_after
+        return response
+
+    except ValidationError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        return _build_error_response(e.error, message=e.message)
+
+    except SheetsError as e:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=e.error.code, duration_ms=duration)
+        return _build_error_response(e.error, message=e.message)
+
+    except Exception:
+        duration = int((time.time() - start_time) * 1000)
+        _safe_log(api_key=company_id, tool=tool_name, inputs={}, outcome=Errors.INTERNAL_ERROR.code, duration_ms=duration)
         return _build_error_response(Errors.INTERNAL_ERROR)
 
 # ── Tool 3 — get_top_performers ─────────────────────────────────────
