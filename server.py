@@ -881,7 +881,12 @@ def get_top_performers(
     or who had the highest scores.
 
     Requires:
-    - period : one of "daily", "weekly", "monthly", or a specific date like "2026-07-16"
+    - period : one of
+        - "daily"                        (today only)
+        - "weekly"                       (last 7 days)
+        - "monthly"                      (last 30 days)
+        - "YYYY-MM-DD"                   (that specific date)
+        - "YYYY-MM-DD to YYYY-MM-DD"     (a custom date range, inclusive)
 
     Returns a ranked list sorted by performance_score = avg_focus*0.6 + avg_tasks*0.4.
     Permission-aware: viewers only see rankings for employees they have access to.
@@ -925,7 +930,14 @@ def get_top_performers(
         # LAYER 5 — INPUT VALIDATION
         validated = validate_input(TopPerformersInput, {"period": period})
 
-        # ── Date range calculation (before Layer 6 fetch)
+        # LAYER 6 — DATE RANGE
+        # Accepts:
+        #   "daily"                        -> today
+        #   "weekly"                       -> last 7 days
+        #   "monthly"                      -> last 30 days
+        #   "YYYY-MM-DD"                   -> that single date
+        #   "YYYY-MM-DD to YYYY-MM-DD"     -> a range
+        
         from datetime import timedelta
         today = datetime.now(timezone.utc).date()
         period_label = validated.period.lower().strip()
@@ -939,6 +951,22 @@ def get_top_performers(
         elif period_label == "monthly":
             start_date = today - timedelta(days=30)
             end_date = today
+        elif " to " in period_label:
+            # Range: "2026-07-10 to 2026-07-16"
+            try:
+                left, right = [p.strip() for p in period_label.split(" to ", 1)]
+                start_date = datetime.strptime(left, "%Y-%m-%d").date()
+                end_date = datetime.strptime(right, "%Y-%m-%d").date()
+                if start_date > end_date:
+                    return _build_error_response(
+                        Errors.INVALID_PARAMETER,
+                        message=f"Start date '{left}' is after end date '{right}'."
+                    )
+            except ValueError:
+                return _build_error_response(
+                    Errors.INVALID_PARAMETER,
+                    message=f"Invalid range '{validated.period}'. Use 'YYYY-MM-DD to YYYY-MM-DD'."
+                )
         else:
             try:
                 specific_date = datetime.strptime(period_label, "%Y-%m-%d").date()
@@ -947,7 +975,12 @@ def get_top_performers(
             except ValueError:
                 return _build_error_response(
                     Errors.INVALID_PARAMETER,
-                    message=f"Invalid period '{validated.period}'. Use 'daily', 'weekly', 'monthly', or a date like '2026-07-16'."
+                    message=(
+                        f"Invalid period '{validated.period}'. "
+                        f"Use 'daily', 'weekly', 'monthly', "
+                        f"a date like '2026-07-16', or a range like "
+                        f"'2026-07-10 to 2026-07-16'."
+                    )
                 )
 
         # LAYER 6 — DATA FETCH (tenant-scoped + visibility-scoped)

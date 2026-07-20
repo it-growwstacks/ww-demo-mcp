@@ -1,9 +1,8 @@
 # validators.py
 # Layer 5 — Input Validation
 # Pydantic models define the exact shape of valid input for each tool.
-# Every tool call is validated against these models before any
-# business logic runs. Bad input is rejected here with a clear error —
-# it never reaches the Google Sheets API.
+# Every tool call is validated against these models before any business
+# logic runs. Bad input is rejected here with a clear error.
 
 import re
 from datetime import datetime
@@ -11,18 +10,23 @@ from pydantic import BaseModel, Field, field_validator
 from error_codes import Errors, ErrorDef
 
 
-# ── Date format validator (reused across multiple tools) ──────────────
+# ── Shared helpers ────────────────────────────────────────────────────
 
-def validate_date_format(date_str: str) -> str:
+# Employee identifier can be either a code (E001) or a name ("Vaidehi Gupta").
+# Allows letters, digits, spaces, hyphens, apostrophes and dots — enough for
+# most human names without allowing injection characters.
+_EMPLOYEE_CODE_PATTERN = r"^[A-Za-z0-9\-\s\.']+$"
+_EMPLOYEE_CODE_MAX = 60
+
+def _validate_date_format(date_str: str) -> str:
     """
-    Validates that a date string is in YYYY-MM-DD format.
+    Validates that a date string is either 'today' or in YYYY-MM-DD format.
     Raises ValueError if the format is wrong.
     """
     if not date_str or date_str.lower() == "today":
         return date_str
 
-    pattern = r"^\d{4}-\d{2}-\d{2}$"
-    if not re.match(pattern, date_str):
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
         raise ValueError(
             f"Date '{date_str}' must be in YYYY-MM-DD format, e.g. 2026-07-07"
         )
@@ -35,82 +39,74 @@ def validate_date_format(date_str: str) -> str:
     return date_str
 
 
-# ── Input model for get_employee_status ──────────────────────────────
+# ── Tool input models ─────────────────────────────────────────────────
 
 class EmployeeStatusInput(BaseModel):
+    """Input for get_employee_status."""
     employee_code: str = Field(
         min_length=1,
-        max_length=50,
-        pattern=r'^[A-Za-z0-9\-\s]+$',
-        description="Employee code (e.g. E001) or employee name (e.g. Mohit)"
+        max_length=_EMPLOYEE_CODE_MAX,
+        pattern=_EMPLOYEE_CODE_PATTERN,
+        description="Employee code (e.g. E001) or employee name (e.g. Mohit)",
     )
-    model_config = {"populate_by_name": True}
 
     @field_validator("employee_code")
     @classmethod
     def strip_whitespace(cls, v: str) -> str:
         return v.strip()
 
+
 class DailyBriefInput(BaseModel):
+    """Input for get_daily_brief."""
     employee_code: str = Field(
         min_length=1,
-        max_length=50,
-        pattern=r'^[A-Za-z0-9\-\s]+$',
-        description="Employee code (e.g. E001) or employee name (e.g. Mohit)"
+        max_length=_EMPLOYEE_CODE_MAX,
+        pattern=_EMPLOYEE_CODE_PATTERN,
+        description="Employee code (e.g. E001) or employee name (e.g. Mohit)",
     )
     date: str = Field(
-        pattern=r'^\d{4}-\d{2}-\d{2}$',
-        description="Date in YYYY-MM-DD format, e.g. 2026-07-01"
+        default="today",
+        description="Date in YYYY-MM-DD format, or 'today'. Defaults to today.",
     )
+
+    @field_validator("employee_code")
+    @classmethod
+    def strip_employee_code(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("date")
+    @classmethod
+    def validate_date(cls, v: str) -> str:
+        return _validate_date_format(v)
+
 
 class TopPerformersInput(BaseModel):
+    """
+    Input for get_top_performers.
+
+    Accepts:
+      - "daily", "weekly", "monthly"
+      - a single date "YYYY-MM-DD"
+      - a range "YYYY-MM-DD to YYYY-MM-DD"
+
+    max_length raised to 30 to accommodate the range format.
+    """
     period: str = Field(
         min_length=1,
-        max_length=20,
-        description="Period: 'daily', 'weekly', 'monthly', or a specific date in YYYY-MM-DD format"
+        max_length=30,
+        description=(
+            "Period: 'daily', 'weekly', 'monthly', a specific date like "
+            "'2026-07-16', or a range like '2026-07-01 to 2026-07-16'."
+        ),
     )
 
-# ── Input model for get_team_summary ─────────────────────────────────
-
-class TeamSummaryInput(BaseModel):
-    date: str = Field(default="today", description="Date in YYYY-MM-DD format. Defaults to today.")
-
-    @field_validator("date")
+    @field_validator("period")
     @classmethod
-    def validate_date(cls, v: str) -> str:
-        return validate_date_format(v)
-
-
-# ── Input model for get_daily_brief ──────────────────────────────────
-
-class DailyBriefInput(BaseModel):
-    employee_code: str = Field(min_length=1, max_length=20, description="Employee code, e.g. E001")
-    date: str = Field(default="today", description="Date in YYYY-MM-DD format. Defaults to today.")
-
-    @field_validator("employee_code")
-    @classmethod
-    def strip_employee_code(cls, v: str) -> str:
-        return v.strip()
-
-    @field_validator("date")
-    @classmethod
-    def validate_date(cls, v: str) -> str:
-        return validate_date_format(v)
-
-
-# ── Input model for get_employee_history ─────────────────────────────
-
-class EmployeeHistoryInput(BaseModel):
-    employee_code: str = Field(min_length=1, max_length=20, description="Employee code, e.g. E001")
-    days: int = Field(default=7, ge=1, le=30, description="Number of days of history. Min 1, max 30.")
-
-    @field_validator("employee_code")
-    @classmethod
-    def strip_employee_code(cls, v: str) -> str:
+    def strip_period(cls, v: str) -> str:
         return v.strip()
 
 
-# ── Validation helper used by server.py ──────────────────────────────
+# ── Validation entry point used by server.py ─────────────────────────
 
 class ValidationError(Exception):
     """
@@ -125,7 +121,7 @@ class ValidationError(Exception):
 
 def validate_input(model_class, raw_input: dict) -> object:
     """
-    Validates raw input against a Pydantic model.
+    Validate raw input against a Pydantic model.
     Returns the validated model instance if valid.
     Raises ValidationError with a clean message if invalid.
     """
@@ -133,9 +129,18 @@ def validate_input(model_class, raw_input: dict) -> object:
         return model_class(**raw_input)
     except Exception as e:
         error_detail = str(e)
-        if "date" in error_detail.lower():
-            raise ValidationError(Errors.INVALID_DATE_FORMAT)
+        # Prefer the specific date error when a date field is at fault.
+        # We check for both the field name and the format string to avoid
+        # false positives on the word "date" appearing incidentally.
+        lower = error_detail.lower()
+        is_date_error = (
+            "yyyy-mm-dd" in lower
+            or "not a valid calendar date" in lower
+        )
+        if is_date_error:
+            raise ValidationError(Errors.INVALID_DATE_FORMAT, message=error_detail)
+
         raise ValidationError(
             Errors.INVALID_PARAMETER,
-            message=f"{Errors.INVALID_PARAMETER.message} {error_detail}"
+            message=f"{Errors.INVALID_PARAMETER.message} {error_detail}",
         )
